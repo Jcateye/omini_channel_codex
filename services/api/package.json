@@ -1,0 +1,26 @@
+{
+  "name": "@omini/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.11.1",
+    "@omini/core": "workspace:*",
+    "@omini/database": "workspace:*",
+    "@omini/queue": "workspace:*",
+    "hono": "^4.5.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.3.0"
+  }
+}

@@ -1,0 +1,243 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  whatsapp
+  twitter
+  instagram
+  tiktok
+}
+
+enum ChannelStatus {
+  connected
+  disconnected
+  error
+  pending
+}
+
+enum MessageType {
+  text
+}
+
+enum MessageDirection {
+  inbound
+  outbound
+}
+
+enum MessageStatus {
+  pending
+  sent
+  delivered
+  read
+  failed
+}
+
+enum ConversationStatus {
+  open
+  closed
+  pending
+}
+
+enum LeadStage {
+  new
+  qualified
+  nurtured
+  converted
+  lost
+}
+
+enum WebhookDeliveryStatus {
+  pending
+  success
+  failed
+}
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  settings  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys            ApiKey[]
+  channels           Channel[]
+  contacts           Contact[]
+  contactIdentifiers ContactIdentifier[]
+  conversations      Conversation[]
+  messages           Message[]
+  leads              Lead[]
+  webhookDeliveries  WebhookDelivery[]
+}
+
+model ApiKey {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  prefix         String   @unique
+  hash           String
+  lastUsedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+}
+
+model Channel {
+  id             String        @id @default(uuid())
+  organizationId String
+  platform       Platform
+  provider       String?
+  name           String
+  externalId     String
+  status         ChannelStatus
+  credentials    Json
+  settings       Json?
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  conversations Conversation[]
+  messages      Message[]
+
+  @@index([organizationId])
+  @@unique([organizationId, platform, externalId])
+}
+
+model Contact {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String?
+  email          String?
+  phone          String?
+  tags           String[] @default([])
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  identifiers ContactIdentifier[]
+  conversations Conversation[]
+  messages      Message[]
+  leads         Lead[]
+
+  @@index([organizationId])
+  @@index([organizationId, phone])
+}
+
+model ContactIdentifier {
+  id             String   @id @default(uuid())
+  organizationId String
+  contactId      String
+  platform       Platform
+  externalId     String
+  handle         String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  contact      Contact      @relation(fields: [contactId], references: [id])
+
+  @@unique([organizationId, platform, externalId])
+  @@index([contactId])
+}
+
+model Conversation {
+  id             String             @id @default(uuid())
+  organizationId String
+  channelId      String
+  contactId      String
+  platform       Platform
+  externalId     String
+  status         ConversationStatus
+  lastMessageAt  DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  channel      Channel      @relation(fields: [channelId], references: [id])
+  contact      Contact      @relation(fields: [contactId], references: [id])
+  messages     Message[]
+  leads        Lead[]
+
+  @@index([organizationId])
+  @@index([channelId])
+  @@index([contactId])
+  @@unique([channelId, externalId])
+}
+
+model Message {
+  id             String           @id @default(uuid())
+  organizationId String
+  conversationId String
+  channelId      String
+  contactId      String
+  platform       Platform
+  externalId     String?
+  type           MessageType
+  direction      MessageDirection
+  status         MessageStatus
+  content        Json
+  rawPayload     Json?
+  sentAt         DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  conversation Conversation @relation(fields: [conversationId], references: [id])
+  channel      Channel      @relation(fields: [channelId], references: [id])
+  contact      Contact      @relation(fields: [contactId], references: [id])
+
+  @@index([organizationId])
+  @@index([conversationId])
+  @@index([channelId])
+  @@index([contactId])
+}
+
+model Lead {
+  id             String    @id @default(uuid())
+  organizationId String
+  contactId      String?
+  conversationId String?
+  stage          LeadStage @default(new)
+  score          Float?
+  tags           String[]  @default([])
+  source         String?
+  metadata       Json?
+  lastActivityAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  contact      Contact?     @relation(fields: [contactId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+
+  @@index([organizationId])
+  @@index([contactId])
+}
+
+model WebhookDelivery {
+  id             String                @id @default(uuid())
+  organizationId String
+  eventType      String
+  targetUrl      String
+  payload        Json
+  status         WebhookDeliveryStatus @default(pending)
+  responseCode   Int?
+  errorMessage   String?
+  attempt        Int                   @default(0)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+}
