@@ -55,6 +55,7 @@ export const QUEUE_NAMES = {
   statusEvents: 'whatsapp.status',
   campaignSends: 'campaign.sends',
   agentReplies: 'agent.replies',
+  analyticsMetrics: 'analytics.metrics',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];

@@ -74,6 +74,27 @@ enum CampaignSendStatus {
   skipped
 }
 
+enum AttributionModel {
+  last_touch
+}
+
+enum ToolKind {
+  internal
+  external
+}
+
+enum ToolExecutionStatus {
+  success
+  error
+  denied
+}
+
+enum PromptOutcome {
+  success
+  failure
+  unknown
+}
+
 model Organization {
   id        String   @id @default(uuid())
   name      String
@@ -93,6 +114,13 @@ model Organization {
   campaignSegments   CampaignSegment[]
   campaignSends      CampaignSend[]
   webhookDeliveries  WebhookDelivery[]
+  leadAttributions   LeadAttribution[]
+  analyticsDaily     AnalyticsDaily[]
+  toolDefinitions    ToolDefinition[]
+  toolPermissions    ToolPermission[]
+  promptTemplates    PromptTemplate[]
+  promptUsages       PromptUsage[]
+  toolExecutionLogs  ToolExecutionLog[]
 }
 
 model ApiKey {
@@ -128,6 +156,8 @@ model Channel {
   conversations Conversation[]
   messages      Message[]
   campaigns     Campaign[]
+  leadAttributions LeadAttribution[]
+  analyticsDaily   AnalyticsDaily[]
 
   @@index([organizationId])
   @@unique([organizationId, platform, externalId])
@@ -216,6 +246,7 @@ model Message {
   channel      Channel      @relation(fields: [channelId], references: [id])
   contact      Contact      @relation(fields: [contactId], references: [id])
   campaignSends CampaignSend[]
+  leadAttributions LeadAttribution[]
 
   @@index([organizationId])
   @@index([conversationId])
@@ -234,6 +265,7 @@ model Lead {
   source         String?
   metadata       Json?
   lastActivityAt DateTime?
+  convertedAt    DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
@@ -241,6 +273,7 @@ model Lead {
   contact      Contact?     @relation(fields: [contactId], references: [id])
   conversation Conversation? @relation(fields: [conversationId], references: [id])
   campaignSends CampaignSend[]
+  attributions LeadAttribution[]
 
   @@index([organizationId])
   @@index([contactId])
@@ -256,6 +289,8 @@ model Campaign {
   scheduledAt    DateTime?
   startedAt      DateTime?
   completedAt    DateTime?
+  cost           Float?
+  revenue        Float?
   totalQueued    Int            @default(0)
   totalSent      Int            @default(0)
   totalFailed    Int            @default(0)
@@ -268,6 +303,8 @@ model Campaign {
   channel      Channel        @relation(fields: [channelId], references: [id])
   segment      CampaignSegment? @relation(fields: [segmentId], references: [id])
   sends        CampaignSend[]
+  attributions LeadAttribution[]
+  analyticsDaily AnalyticsDaily[]
 
   @@index([organizationId])
   @@index([channelId])
@@ -329,4 +366,154 @@ model WebhookDelivery {
   organization Organization @relation(fields: [organizationId], references: [id])
 
   @@index([organizationId])
+}
+
+model ToolDefinition {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  version        String
+  kind           ToolKind
+  provider       String?
+  description    String?
+  protocol       String   @default("v1")
+  schema         Json
+  config         Json?
+  auth           Json?
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id])
+  permissions  ToolPermission[]
+  executions   ToolExecutionLog[]
+
+  @@index([organizationId])
+  @@unique([organizationId, name, version])
+}
+
+model ToolPermission {
+  id             String   @id @default(uuid())
+  organizationId String
+  toolId         String
+  agentId        String?
+  allowed        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  tool         ToolDefinition @relation(fields: [toolId], references: [id])
+
+  @@index([organizationId])
+  @@index([toolId])
+  @@unique([organizationId, toolId, agentId])
+}
+
+model PromptTemplate {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  version        String
+  content        String
+  metadata       Json?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  usages       PromptUsage[]
+
+  @@index([organizationId])
+  @@unique([organizationId, name, version])
+}
+
+model PromptUsage {
+  id             String        @id @default(uuid())
+  organizationId String
+  promptId       String
+  agentId        String?
+  outcome        PromptOutcome @default(unknown)
+  latencyMs      Int?
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  prompt       PromptTemplate @relation(fields: [promptId], references: [id])
+
+  @@index([organizationId])
+  @@index([promptId])
+  @@index([agentId])
+  @@index([outcome])
+}
+
+model ToolExecutionLog {
+  id             String             @id @default(uuid())
+  organizationId String
+  toolId         String
+  agentId        String?
+  status         ToolExecutionStatus
+  latencyMs      Int?
+  errorMessage   String?
+  requestPayload Json
+  responsePayload Json?
+  createdAt      DateTime           @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  tool         ToolDefinition @relation(fields: [toolId], references: [id])
+
+  @@index([organizationId])
+  @@index([toolId])
+  @@index([agentId])
+}
+
+model LeadAttribution {
+  id             String           @id @default(uuid())
+  organizationId String
+  leadId         String
+  campaignId     String?
+  messageId      String?
+  channelId      String?
+  model          AttributionModel @default(last_touch)
+  attributedAt   DateTime
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead         @relation(fields: [leadId], references: [id])
+  campaign     Campaign?    @relation(fields: [campaignId], references: [id])
+  message      Message?     @relation(fields: [messageId], references: [id])
+  channel      Channel?     @relation(fields: [channelId], references: [id])
+
+  @@unique([leadId, model])
+  @@index([organizationId])
+  @@index([campaignId])
+  @@index([channelId])
+  @@index([attributedAt])
+}
+
+model AnalyticsDaily {
+  id                     String   @id @default(uuid())
+  organizationId         String
+  date                   DateTime
+  channelId              String?
+  campaignId             String?
+  outboundSent           Int      @default(0)
+  outboundDelivered      Int      @default(0)
+  outboundFailed         Int      @default(0)
+  inboundCount           Int      @default(0)
+  responseCount          Int      @default(0)
+  leadCreated            Int      @default(0)
+  leadConverted          Int      @default(0)
+  attributedConversions  Int      @default(0)
+  attributedRevenue      Float?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  channel      Channel?     @relation(fields: [channelId], references: [id])
+  campaign     Campaign?    @relation(fields: [campaignId], references: [id])
+
+  @@unique([organizationId, date, channelId, campaignId])
+  @@index([organizationId])
+  @@index([date])
 }

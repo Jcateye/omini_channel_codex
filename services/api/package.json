@@ -15,6 +15,7 @@
   "dependencies": {
     "@hono/node-server": "^1.11.1",
     "@omini/agent-routing": "workspace:*",
+    "@omini/agent-tools": "workspace:*",
     "@omini/core": "workspace:*",
     "@omini/database": "workspace:*",
     "@omini/queue": "workspace:*",

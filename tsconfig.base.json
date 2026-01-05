@@ -31,6 +31,8 @@
       "@omini/queue/*": ["packages/queue/src/*"],
       "@omini/agent-routing": ["packages/agent-routing/src"],
       "@omini/agent-routing/*": ["packages/agent-routing/src/*"],
+      "@omini/agent-tools": ["packages/agent-tools/src"],
+      "@omini/agent-tools/*": ["packages/agent-tools/src/*"],
       "@omini/whatsapp-bsp": ["packages/whatsapp-bsp/src"],
       "@omini/whatsapp-bsp/*": ["packages/whatsapp-bsp/src/*"]
     }

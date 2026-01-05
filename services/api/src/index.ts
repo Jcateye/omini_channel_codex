@@ -7,6 +7,9 @@ import type { Prisma } from '@prisma/client';
 import { applyLeadRules, type LeadRule } from '@omini/core';
 import type { AgentRoutingConfig, AgentRoutingRule } from '@omini/agent-routing';
 import { listAgentAdapters, selectAgent } from '@omini/agent-routing';
+import type { ToolExecutionRequest } from '@omini/agent-tools';
+import { executeTool, getExternalAdapter, listExternalAdapters, registerExternalAdapter } from '@omini/agent-tools';
+import { mockExternalAdapter } from '@omini/agent-tools';
 import { prisma } from '@omini/database';
 import { createQueue, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter } from '@omini/whatsapp-bsp';
@@ -24,6 +27,8 @@ type ApiEnv = {
 const app = new Hono<ApiEnv>();
 const api = new Hono<ApiEnv>();
 const admin = new Hono();
+
+registerExternalAdapter(mockExternalAdapter);
 
 const inboundQueue = createQueue(QUEUE_NAMES.inboundEvents);
 const crmQueue = createQueue(QUEUE_NAMES.crmWebhooks);
@@ -123,6 +128,164 @@ const normalizeTags = (input: unknown) => {
     .filter((tag) => typeof tag === 'string')
     .map((tag) => tag.trim())
     .filter((tag) => tag.length > 0);
+};
+
+const applyConversionUpdate = (currentStage: string, updates: Record<string, unknown>) => {
+  if (typeof updates.stage !== 'string') {
+    return updates;
+  }
+
+  if (updates.stage === 'converted' && currentStage !== 'converted') {
+    return { ...updates, convertedAt: new Date() };
+  }
+
+  if (updates.stage !== 'converted' && currentStage === 'converted') {
+    return { ...updates, convertedAt: null };
+  }
+
+  return updates;
+};
+
+const parseDate = (raw?: string | null) => {
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+};
+
+const toDayStart = (value: Date) =>
+  new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
+
+const addDays = (value: Date, days: number) => {
+  const next = new Date(value);
+  next.setUTCDate(next.getUTCDate() + days);
+  return next;
+};
+
+const resolveDateRange = (startRaw?: string | null, endRaw?: string | null) => {
+  const now = new Date();
+  const endDate = parseDate(endRaw) ?? now;
+  const endStart = toDayStart(endDate);
+  const end = addDays(endStart, 1);
+
+  const startDate = parseDate(startRaw) ?? addDays(endStart, -6);
+  const start = toDayStart(startDate);
+
+  return { start, end };
+};
+
+const safeRate = (numerator: number, denominator: number) =>
+  denominator > 0 ? Number((numerator / denominator).toFixed(4)) : 0;
+
+const clampNumber = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
+
+const normalizeAnalyticsSettings = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return {
+      attributionLookbackDays: 7,
+      aggregationDays: 30,
+      realtimeWindowMinutes: 60,
+    };
+  }
+
+  const settings = input as Record<string, unknown>;
+  const attributionLookbackDaysRaw =
+    typeof settings.attributionLookbackDays === 'number'
+      ? settings.attributionLookbackDays
+      : 7;
+  const aggregationDaysRaw =
+    typeof settings.aggregationDays === 'number' ? settings.aggregationDays : 30;
+  const realtimeWindowMinutesRaw =
+    typeof settings.realtimeWindowMinutes === 'number' ? settings.realtimeWindowMinutes : 60;
+
+  return {
+    attributionLookbackDays: clampNumber(Math.floor(attributionLookbackDaysRaw), 1, 60),
+    aggregationDays: clampNumber(Math.floor(aggregationDaysRaw), 7, 180),
+    realtimeWindowMinutes: clampNumber(Math.floor(realtimeWindowMinutesRaw), 5, 1440),
+  };
+};
+
+const normalizeToolSchema = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return { input: {}, output: {} };
+  }
+  const schema = input as Record<string, unknown>;
+  const inputSchema =
+    schema.input && typeof schema.input === 'object' && !Array.isArray(schema.input)
+      ? (schema.input as Record<string, unknown>)
+      : {};
+  const outputSchema =
+    schema.output && typeof schema.output === 'object' && !Array.isArray(schema.output)
+      ? (schema.output as Record<string, unknown>)
+      : {};
+  return { input: inputSchema, output: outputSchema };
+};
+
+const normalizeToolDefinitionInput = (input: Record<string, unknown>) => {
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  const version = typeof input.version === 'string' ? input.version.trim() : 'v1';
+  const kind = typeof input.kind === 'string' ? input.kind.trim() : 'internal';
+  const provider = typeof input.provider === 'string' ? input.provider.trim() : null;
+  const description = typeof input.description === 'string' ? input.description.trim() : null;
+  const protocol = typeof input.protocol === 'string' ? input.protocol.trim() : 'v1';
+  const schema = normalizeToolSchema(input.schema);
+  const config =
+    input.config && typeof input.config === 'object' && !Array.isArray(input.config)
+      ? (input.config as Record<string, unknown>)
+      : null;
+  const auth =
+    input.auth && typeof input.auth === 'object' && !Array.isArray(input.auth)
+      ? (input.auth as Record<string, unknown>)
+      : null;
+  const enabled = typeof input.enabled === 'boolean' ? input.enabled : true;
+
+  return {
+    name,
+    version,
+    kind,
+    provider,
+    description,
+    protocol,
+    schema,
+    config,
+    auth,
+    enabled,
+  };
+};
+
+const normalizePromptInput = (input: Record<string, unknown>) => {
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  const version = typeof input.version === 'string' ? input.version.trim() : 'v1';
+  const content = typeof input.content === 'string' ? input.content : '';
+  const metadata =
+    input.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata)
+      ? (input.metadata as Record<string, unknown>)
+      : null;
+  const active = typeof input.active === 'boolean' ? input.active : true;
+  return { name, version, content, metadata, active };
+};
+
+const normalizePermissionInput = (input: Record<string, unknown>) => {
+  const agentId = typeof input.agentId === 'string' ? input.agentId.trim() : null;
+  const allowed = typeof input.allowed === 'boolean' ? input.allowed : true;
+  return { agentId: agentId || null, allowed };
+};
+
+const checkToolPermission = async (organizationId: string, toolId: string, agentId?: string | null) => {
+  const permissions = await prisma.toolPermission.findMany({
+    where: { organizationId, toolId },
+  });
+
+  if (permissions.length === 0) {
+    return true;
+  }
+
+  const match = permissions.find((perm) => perm.agentId === agentId) ??
+    permissions.find((perm) => perm.agentId === null);
+  return match?.allowed ?? false;
 };
 
 const normalizeStringList = (input: unknown) => {
@@ -484,6 +647,808 @@ api.post('/v1/agent-routing/test', async (c) => {
   return c.json({ decision });
 });
 
+api.get('/v1/analytics/summary', async (c) => {
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const aggregate = await prisma.analyticsDaily.aggregate({
+    where: {
+      organizationId: c.get('tenantId'),
+      date: { gte: start, lt: end },
+      channelId: null,
+      campaignId: null,
+    },
+    _sum: {
+      outboundSent: true,
+      outboundDelivered: true,
+      outboundFailed: true,
+      inboundCount: true,
+      responseCount: true,
+      leadCreated: true,
+      leadConverted: true,
+      attributedConversions: true,
+    },
+  });
+
+  const totals = aggregate._sum;
+  const outboundSent = totals.outboundSent ?? 0;
+  const outboundDelivered = totals.outboundDelivered ?? 0;
+  const outboundFailed = totals.outboundFailed ?? 0;
+  const inboundCount = totals.inboundCount ?? 0;
+  const responseCount = totals.responseCount ?? 0;
+  const leadCreated = totals.leadCreated ?? 0;
+  const leadConverted = totals.leadConverted ?? 0;
+  const attributedConversions = totals.attributedConversions ?? 0;
+
+  return c.json({
+    range: { start: start.toISOString(), end: end.toISOString() },
+    totals: {
+      outboundSent,
+      outboundDelivered,
+      outboundFailed,
+      inboundCount,
+      responseCount,
+      leadCreated,
+      leadConverted,
+      attributedConversions,
+    },
+    rates: {
+      deliveryRate: safeRate(outboundDelivered, outboundSent),
+      responseRate: safeRate(responseCount, outboundSent),
+      conversionRate: safeRate(leadConverted, leadCreated),
+    },
+  });
+});
+
+api.get('/v1/analytics/channels', async (c) => {
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const rows = await prisma.analyticsDaily.groupBy({
+    by: ['channelId'],
+    where: {
+      organizationId: c.get('tenantId'),
+      date: { gte: start, lt: end },
+      channelId: { not: null },
+      campaignId: null,
+    },
+    _sum: {
+      outboundSent: true,
+      outboundDelivered: true,
+      outboundFailed: true,
+      inboundCount: true,
+      responseCount: true,
+      attributedConversions: true,
+    },
+  });
+
+  const channelIds = rows
+    .map((row) => row.channelId)
+    .filter((value): value is string => !!value);
+
+  const channels = channelIds.length
+    ? await prisma.channel.findMany({
+        where: { id: { in: channelIds }, organizationId: c.get('tenantId') },
+        select: { id: true, name: true, platform: true, provider: true },
+      })
+    : [];
+
+  const channelMap = new Map(channels.map((channel) => [channel.id, channel]));
+
+  const metrics = rows.map((row) => {
+    const outboundSent = row._sum.outboundSent ?? 0;
+    const outboundDelivered = row._sum.outboundDelivered ?? 0;
+    const responseCount = row._sum.responseCount ?? 0;
+
+    return {
+      channel: channelMap.get(row.channelId ?? '') ?? null,
+      outboundSent,
+      outboundDelivered,
+      outboundFailed: row._sum.outboundFailed ?? 0,
+      inboundCount: row._sum.inboundCount ?? 0,
+      responseCount,
+      attributedConversions: row._sum.attributedConversions ?? 0,
+      deliveryRate: safeRate(outboundDelivered, outboundSent),
+      responseRate: safeRate(responseCount, outboundSent),
+    };
+  });
+
+  return c.json({ range: { start: start.toISOString(), end: end.toISOString() }, channels: metrics });
+});
+
+api.get('/v1/analytics/campaigns', async (c) => {
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const rows = await prisma.analyticsDaily.groupBy({
+    by: ['campaignId'],
+    where: {
+      organizationId: c.get('tenantId'),
+      date: { gte: start, lt: end },
+      campaignId: { not: null },
+    },
+    _sum: {
+      outboundSent: true,
+      outboundDelivered: true,
+      outboundFailed: true,
+      attributedConversions: true,
+    },
+  });
+
+  const campaignIds = rows
+    .map((row) => row.campaignId)
+    .filter((value): value is string => !!value);
+
+  const campaigns = campaignIds.length
+    ? await prisma.campaign.findMany({
+        where: { id: { in: campaignIds }, organizationId: c.get('tenantId') },
+        select: { id: true, name: true, cost: true, revenue: true, status: true },
+      })
+    : [];
+
+  const campaignMap = new Map(campaigns.map((campaign) => [campaign.id, campaign]));
+
+  const metrics = rows.map((row) => {
+    const outboundSent = row._sum.outboundSent ?? 0;
+    const outboundDelivered = row._sum.outboundDelivered ?? 0;
+    const campaign = campaignMap.get(row.campaignId ?? '') ?? null;
+    const cost = campaign?.cost ?? null;
+    const revenue = campaign?.revenue ?? null;
+    const roi =
+      typeof cost === 'number' && cost > 0 && typeof revenue === 'number'
+        ? Number(((revenue - cost) / cost).toFixed(4))
+        : null;
+
+    return {
+      campaign,
+      outboundSent,
+      outboundDelivered,
+      outboundFailed: row._sum.outboundFailed ?? 0,
+      attributedConversions: row._sum.attributedConversions ?? 0,
+      deliveryRate: safeRate(outboundDelivered, outboundSent),
+      roi,
+    };
+  });
+
+  return c.json({ range: { start: start.toISOString(), end: end.toISOString() }, campaigns: metrics });
+});
+
+api.get('/v1/analytics/attribution', async (c) => {
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const campaignRows = await prisma.leadAttribution.groupBy({
+    by: ['campaignId'],
+    where: {
+      organizationId: c.get('tenantId'),
+      campaignId: { not: null },
+      attributedAt: { gte: start, lt: end },
+    },
+    _count: { _all: true },
+  });
+
+  const channelRows = await prisma.leadAttribution.groupBy({
+    by: ['channelId'],
+    where: {
+      organizationId: c.get('tenantId'),
+      channelId: { not: null },
+      attributedAt: { gte: start, lt: end },
+    },
+    _count: { _all: true },
+  });
+
+  return c.json({
+    range: { start: start.toISOString(), end: end.toISOString() },
+    campaigns: campaignRows.map((row) => ({
+      campaignId: row.campaignId,
+      conversions: row._count._all,
+    })),
+    channels: channelRows.map((row) => ({
+      channelId: row.channelId,
+      conversions: row._count._all,
+    })),
+  });
+});
+
+api.get('/v1/analytics/settings', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const analytics = normalizeAnalyticsSettings(settings.analytics);
+
+  return c.json({ analytics });
+});
+
+api.put('/v1/analytics/settings', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const analytics = normalizeAnalyticsSettings(body.analytics ?? body);
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        analytics,
+      },
+    },
+  });
+
+  return c.json({ analytics });
+});
+
+api.get('/v1/analytics/realtime', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const analyticsSettings = normalizeAnalyticsSettings(settings.analytics);
+  const windowMinutesRaw = c.req.query('windowMinutes');
+  const windowMinutes = windowMinutesRaw
+    ? clampNumber(Number(windowMinutesRaw), 5, 1440)
+    : analyticsSettings.realtimeWindowMinutes;
+
+  const end = new Date();
+  const start = new Date(end.getTime() - windowMinutes * 60 * 1000);
+
+  const [outboundSent, outboundDelivered, outboundFailed, inboundCount] = await Promise.all([
+    prisma.message.count({
+      where: {
+        organizationId: c.get('tenantId'),
+        direction: 'outbound',
+        createdAt: { gte: start, lt: end },
+      },
+    }),
+    prisma.message.count({
+      where: {
+        organizationId: c.get('tenantId'),
+        direction: 'outbound',
+        status: { in: ['delivered', 'read'] },
+        createdAt: { gte: start, lt: end },
+      },
+    }),
+    prisma.message.count({
+      where: {
+        organizationId: c.get('tenantId'),
+        direction: 'outbound',
+        status: 'failed',
+        createdAt: { gte: start, lt: end },
+      },
+    }),
+    prisma.message.count({
+      where: {
+        organizationId: c.get('tenantId'),
+        direction: 'inbound',
+        createdAt: { gte: start, lt: end },
+      },
+    }),
+  ]);
+
+  const [leadCreated, leadConverted] = await Promise.all([
+    prisma.lead.count({
+      where: { organizationId: c.get('tenantId'), createdAt: { gte: start, lt: end } },
+    }),
+    prisma.lead.count({
+      where: { organizationId: c.get('tenantId'), convertedAt: { gte: start, lt: end } },
+    }),
+  ]);
+
+  const responseCount = inboundCount;
+
+  return c.json({
+    windowMinutes,
+    range: { start: start.toISOString(), end: end.toISOString() },
+    totals: {
+      outboundSent,
+      outboundDelivered,
+      outboundFailed,
+      inboundCount,
+      responseCount,
+      leadCreated,
+      leadConverted,
+    },
+    rates: {
+      deliveryRate: safeRate(outboundDelivered, outboundSent),
+      responseRate: safeRate(responseCount, outboundSent),
+      conversionRate: safeRate(leadConverted, leadCreated),
+    },
+  });
+});
+
+api.get('/v1/analytics/trends/channels', async (c) => {
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const rows = await prisma.analyticsDaily.findMany({
+    where: {
+      organizationId: c.get('tenantId'),
+      date: { gte: start, lt: end },
+      channelId: { not: null },
+      campaignId: null,
+    },
+    orderBy: { date: 'asc' },
+  });
+
+  const channelIds = Array.from(
+    new Set(rows.map((row) => row.channelId).filter((value): value is string => !!value))
+  );
+  const channels = channelIds.length
+    ? await prisma.channel.findMany({
+        where: { id: { in: channelIds }, organizationId: c.get('tenantId') },
+        select: { id: true, name: true, platform: true, provider: true },
+      })
+    : [];
+  const channelMap = new Map(channels.map((channel) => [channel.id, channel]));
+
+  const series = new Map<string, typeof rows>();
+  for (const row of rows) {
+    if (!row.channelId) continue;
+    const bucket = series.get(row.channelId) ?? [];
+    bucket.push(row);
+    series.set(row.channelId, bucket);
+  }
+
+  return c.json({
+    range: { start: start.toISOString(), end: end.toISOString() },
+    channels: Array.from(series.entries()).map(([channelId, entries]) => ({
+      channel: channelMap.get(channelId) ?? null,
+      points: entries.map((entry) => ({
+        date: entry.date.toISOString(),
+        outboundSent: entry.outboundSent,
+        outboundDelivered: entry.outboundDelivered,
+        outboundFailed: entry.outboundFailed,
+        inboundCount: entry.inboundCount,
+        responseCount: entry.responseCount,
+        attributedConversions: entry.attributedConversions,
+        deliveryRate: safeRate(entry.outboundDelivered, entry.outboundSent),
+        responseRate: safeRate(entry.responseCount, entry.outboundSent),
+      })),
+    })),
+  });
+});
+
+api.get('/v1/analytics/trends/campaigns', async (c) => {
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const rows = await prisma.analyticsDaily.findMany({
+    where: {
+      organizationId: c.get('tenantId'),
+      date: { gte: start, lt: end },
+      campaignId: { not: null },
+    },
+    orderBy: { date: 'asc' },
+  });
+
+  const campaignIds = Array.from(
+    new Set(rows.map((row) => row.campaignId).filter((value): value is string => !!value))
+  );
+  const campaigns = campaignIds.length
+    ? await prisma.campaign.findMany({
+        where: { id: { in: campaignIds }, organizationId: c.get('tenantId') },
+        select: { id: true, name: true, cost: true, revenue: true, status: true },
+      })
+    : [];
+  const campaignMap = new Map(campaigns.map((campaign) => [campaign.id, campaign]));
+
+  const series = new Map<string, typeof rows>();
+  for (const row of rows) {
+    if (!row.campaignId) continue;
+    const bucket = series.get(row.campaignId) ?? [];
+    bucket.push(row);
+    series.set(row.campaignId, bucket);
+  }
+
+  return c.json({
+    range: { start: start.toISOString(), end: end.toISOString() },
+    campaigns: Array.from(series.entries()).map(([campaignId, entries]) => {
+      const campaign = campaignMap.get(campaignId) ?? null;
+      const cost = campaign?.cost ?? null;
+      const revenue = campaign?.revenue ?? null;
+      const roi =
+        typeof cost === 'number' && cost > 0 && typeof revenue === 'number'
+          ? Number(((revenue - cost) / cost).toFixed(4))
+          : null;
+
+      return {
+        campaign,
+        roi,
+        points: entries.map((entry) => ({
+          date: entry.date.toISOString(),
+          outboundSent: entry.outboundSent,
+          outboundDelivered: entry.outboundDelivered,
+          outboundFailed: entry.outboundFailed,
+          attributedConversions: entry.attributedConversions,
+          deliveryRate: safeRate(entry.outboundDelivered, entry.outboundSent),
+        })),
+      };
+    }),
+  });
+});
+
+api.get('/v1/agent-tools', async (c) => {
+  const tools = await prisma.toolDefinition.findMany({
+    where: { organizationId: c.get('tenantId') },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return c.json({ tools });
+});
+
+api.post('/v1/agent-tools', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const normalized = normalizeToolDefinitionInput(body);
+
+  if (!normalized.name || !normalized.version) {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const tool = await prisma.toolDefinition.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      name: normalized.name,
+      version: normalized.version,
+      kind: normalized.kind === 'external' ? 'external' : 'internal',
+      provider: normalized.provider,
+      description: normalized.description,
+      protocol: normalized.protocol,
+      schema: normalized.schema,
+      config: normalized.config,
+      auth: normalized.auth,
+      enabled: normalized.enabled,
+    },
+  });
+
+  return c.json({ tool }, 201);
+});
+
+api.put('/v1/agent-tools/:id', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const normalized = normalizeToolDefinitionInput(body);
+
+  const tool = await prisma.toolDefinition.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!tool) {
+    return c.json({ error: 'tool_not_found' }, 404);
+  }
+
+  const updated = await prisma.toolDefinition.update({
+    where: { id: tool.id },
+    data: {
+      name: normalized.name || tool.name,
+      version: normalized.version || tool.version,
+      kind: normalized.kind === 'external' ? 'external' : 'internal',
+      provider: normalized.provider,
+      description: normalized.description,
+      protocol: normalized.protocol,
+      schema: normalized.schema,
+      config: normalized.config,
+      auth: normalized.auth,
+      enabled: normalized.enabled,
+    },
+  });
+
+  return c.json({ tool: updated });
+});
+
+api.post('/v1/agent-tools/:id/execute', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const tool = await prisma.toolDefinition.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!tool) {
+    return c.json({ error: 'tool_not_found' }, 404);
+  }
+
+  const agentId = typeof body.agentId === 'string' ? body.agentId : null;
+  const inputs =
+    body.inputs && typeof body.inputs === 'object' && !Array.isArray(body.inputs)
+      ? (body.inputs as Record<string, unknown>)
+      : {};
+  const context =
+    body.context && typeof body.context === 'object' && !Array.isArray(body.context)
+      ? (body.context as Record<string, unknown>)
+      : null;
+
+  const allowed = await checkToolPermission(c.get('tenantId'), tool.id, agentId);
+  if (!allowed) {
+    await prisma.toolExecutionLog.create({
+      data: {
+        organizationId: c.get('tenantId'),
+        toolId: tool.id,
+        agentId,
+        status: 'denied',
+        requestPayload: { inputs, context },
+        responsePayload: null,
+      },
+    });
+    return c.json({ error: 'tool_access_denied' }, 403);
+  }
+
+  let result;
+  if (tool.kind === 'external') {
+    const adapterId =
+      tool.config && typeof tool.config === 'object'
+        ? (tool.config as Record<string, unknown>).adapterId
+        : null;
+    const adapter = typeof adapterId === 'string' ? getExternalAdapter(adapterId) : null;
+
+    if (!adapter) {
+      result = { status: 'error', error: 'adapter_not_found' } as const;
+    } else {
+      result = await adapter.execute(tool as unknown as Parameters<typeof executeTool>[0], {
+        toolId: tool.id,
+        agentId,
+        inputs,
+        context,
+      } as ToolExecutionRequest);
+    }
+  } else {
+    result = await executeTool(tool as unknown as Parameters<typeof executeTool>[0], {
+      toolId: tool.id,
+      agentId,
+      inputs,
+      context,
+    } as ToolExecutionRequest);
+  }
+
+  await prisma.toolExecutionLog.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      toolId: tool.id,
+      agentId,
+      status: result.status,
+      latencyMs: result.latencyMs ?? null,
+      errorMessage: result.error ?? null,
+      requestPayload: { inputs, context },
+      responsePayload: result.outputs ?? null,
+    },
+  });
+
+  return c.json({ result });
+});
+
+api.get('/v1/agent-tools/:id/permissions', async (c) => {
+  const tool = await prisma.toolDefinition.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!tool) {
+    return c.json({ error: 'tool_not_found' }, 404);
+  }
+
+  const permissions = await prisma.toolPermission.findMany({
+    where: { organizationId: c.get('tenantId'), toolId: tool.id },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return c.json({ permissions });
+});
+
+api.put('/v1/agent-tools/:id/permissions', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const tool = await prisma.toolDefinition.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!tool) {
+    return c.json({ error: 'tool_not_found' }, 404);
+  }
+
+  const normalized = normalizePermissionInput(body);
+
+  const permission = await prisma.toolPermission.upsert({
+    where: {
+      organizationId_toolId_agentId: {
+        organizationId: c.get('tenantId'),
+        toolId: tool.id,
+        agentId: normalized.agentId,
+      },
+    },
+    update: {
+      allowed: normalized.allowed,
+    },
+    create: {
+      organizationId: c.get('tenantId'),
+      toolId: tool.id,
+      agentId: normalized.agentId,
+      allowed: normalized.allowed,
+    },
+  });
+
+  return c.json({ permission });
+});
+
+api.get('/v1/agent-tools/logs', async (c) => {
+  const toolId = c.req.query('toolId');
+  const agentId = c.req.query('agentId');
+  const limitRaw = c.req.query('limit');
+  const offsetRaw = c.req.query('offset');
+
+  const parseNumber = (value: string | undefined, fallback: number) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const limit = Math.min(200, Math.max(1, parseNumber(limitRaw, 50)));
+  const offset = Math.max(0, parseNumber(offsetRaw, 0));
+
+  const where: Prisma.ToolExecutionLogWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(toolId ? { toolId } : {}),
+    ...(agentId ? { agentId } : {}),
+  };
+
+  const [logs, total] = await Promise.all([
+    prisma.toolExecutionLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+      include: { tool: true },
+    }),
+    prisma.toolExecutionLog.count({ where }),
+  ]);
+
+  return c.json({ logs, total, limit, offset });
+});
+
+api.get('/v1/agent-tools/adapters', async (c) => {
+  return c.json({
+    adapters: listExternalAdapters().map((adapter) => ({
+      id: adapter.id,
+      name: adapter.name,
+      provider: adapter.provider,
+    })),
+  });
+});
+
+api.get('/v1/agent-tools/adapters/:id/health', async (c) => {
+  const adapter = getExternalAdapter(c.req.param('id'));
+  if (!adapter) {
+    return c.json({ error: 'adapter_not_found' }, 404);
+  }
+
+  const health = adapter.healthcheck ? await adapter.healthcheck() : { status: 'ok' };
+  return c.json({ adapter: adapter.id, health });
+});
+
+api.get('/v1/prompts', async (c) => {
+  const name = c.req.query('name');
+  const where: Prisma.PromptTemplateWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(name ? { name } : {}),
+  };
+  const prompts = await prisma.promptTemplate.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+  });
+  return c.json({ prompts });
+});
+
+api.get('/v1/prompts/metrics', async (c) => {
+  const name = c.req.query('name');
+  const promptId = c.req.query('promptId');
+
+  const where: Prisma.PromptUsageWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(promptId ? { promptId } : {}),
+  };
+
+  if (name) {
+    const promptIds = await prisma.promptTemplate.findMany({
+      where: { organizationId: c.get('tenantId'), name },
+      select: { id: true },
+    });
+    where.promptId = { in: promptIds.map((item) => item.id) };
+  }
+
+  const usage = await prisma.promptUsage.groupBy({
+    by: ['promptId', 'outcome'],
+    where,
+    _count: { _all: true },
+  });
+
+  const promptIds = Array.from(new Set(usage.map((row) => row.promptId)));
+  const prompts = promptIds.length
+    ? await prisma.promptTemplate.findMany({
+        where: { id: { in: promptIds } },
+        select: { id: true, name: true, version: true, active: true },
+      })
+    : [];
+
+  const promptMap = new Map(prompts.map((prompt) => [prompt.id, prompt]));
+
+  const metrics = promptIds.map((id) => {
+    const rows = usage.filter((row) => row.promptId === id);
+    const success = rows.find((row) => row.outcome === 'success')?._count._all ?? 0;
+    const failure = rows.find((row) => row.outcome === 'failure')?._count._all ?? 0;
+    const unknown = rows.find((row) => row.outcome === 'unknown')?._count._all ?? 0;
+    const total = success + failure + unknown;
+
+    return {
+      prompt: promptMap.get(id) ?? { id, name: 'unknown', version: 'n/a', active: false },
+      totals: { success, failure, unknown, total },
+      successRate: safeRate(success, total),
+    };
+  });
+
+  return c.json({ metrics });
+});
+
+api.post('/v1/prompts/:id/usage', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const prompt = await prisma.promptTemplate.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!prompt) {
+    return c.json({ error: 'prompt_not_found' }, 404);
+  }
+
+  const agentId = typeof body.agentId === 'string' ? body.agentId : null;
+  const outcomeRaw = typeof body.outcome === 'string' ? body.outcome : 'unknown';
+  const outcome = outcomeRaw === 'success' || outcomeRaw === 'failure' ? outcomeRaw : 'unknown';
+  const latencyMs = typeof body.latencyMs === 'number' ? Math.floor(body.latencyMs) : null;
+  const metadata =
+    body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+      ? (body.metadata as Record<string, unknown>)
+      : null;
+
+  const usage = await prisma.promptUsage.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      promptId: prompt.id,
+      agentId,
+      outcome,
+      latencyMs,
+      metadata,
+    },
+  });
+
+  return c.json({ usage }, 201);
+});
+
+api.post('/v1/prompts', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const normalized = normalizePromptInput(body);
+
+  if (!normalized.name || !normalized.content) {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const prompt = await prisma.promptTemplate.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      name: normalized.name,
+      version: normalized.version,
+      content: normalized.content,
+      metadata: normalized.metadata,
+      active: normalized.active,
+    },
+  });
+
+  return c.json({ prompt }, 201);
+});
+
+api.put('/v1/prompts/:id', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const normalized = normalizePromptInput(body);
+
+  const prompt = await prisma.promptTemplate.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!prompt) {
+    return c.json({ error: 'prompt_not_found' }, 404);
+  }
+
+  const updated = await prisma.promptTemplate.update({
+    where: { id: prompt.id },
+    data: {
+      name: normalized.name || prompt.name,
+      version: normalized.version || prompt.version,
+      content: normalized.content || prompt.content,
+      metadata: normalized.metadata,
+      active: normalized.active,
+    },
+  });
+
+  return c.json({ prompt: updated });
+});
+
 api.get('/v1/crm/webhook', async (c) => {
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   const crmWebhook = settings.crmWebhook ?? null;
@@ -627,10 +1592,11 @@ api.post('/v1/leads/:id/signals', async (c) => {
     return c.json({ lead, matchedRules: ruleResult.matchedRules, updates: {} });
   }
 
+  const updates = applyConversionUpdate(lead.stage, ruleResult.updates);
   const updatedLead = await prisma.lead.update({
     where: { id: lead.id },
     data: {
-      ...ruleResult.updates,
+      ...updates,
       lastActivityAt: new Date(),
     },
   });
@@ -641,7 +1607,7 @@ api.post('/v1/leads/:id/signals', async (c) => {
     {
       lead: updatedLead,
       matchedRules: ruleResult.matchedRules,
-      changes: ruleResult.updates,
+      changes: updates,
       signals,
     },
     settings
@@ -650,7 +1616,7 @@ api.post('/v1/leads/:id/signals', async (c) => {
   return c.json({
     lead: updatedLead,
     matchedRules: ruleResult.matchedRules,
-    updates: ruleResult.updates,
+    updates,
   });
 });
 

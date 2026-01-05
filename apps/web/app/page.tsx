@@ -472,8 +472,23 @@ export default function Home() {
     <main className="min-h-screen px-6 py-12">
       <div className="mx-auto flex max-w-6xl flex-col gap-10">
         <header className="space-y-4">
-          <p className="text-xs uppercase tracking-[0.3em] text-muted">Omini Console</p>
-          <h1 className="text-4xl font-semibold sm:text-5xl">Agent-native mock console</h1>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.3em] text-muted">Omini Console</p>
+              <h1 className="text-4xl font-semibold sm:text-5xl">Agent-native mock console</h1>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" asChild>
+                <Link href="/analytics">Analytics</Link>
+              </Button>
+              <Button variant="outline" asChild>
+                <Link href="/tools">Tools</Link>
+              </Button>
+              <Button variant="outline" asChild>
+                <Link href="/prompts">Prompts</Link>
+              </Button>
+            </div>
+          </div>
           <p className="max-w-2xl text-sm text-muted">
             Minimal UI for lead routing, rule tuning, and signal injection. Use the mock
             endpoints to validate the flow before full integration.

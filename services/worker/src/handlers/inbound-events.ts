@@ -15,6 +15,22 @@ const agentRepliesQueue = createQueue(QUEUE_NAMES.agentReplies);
 
 const normalizePhone = (phone: string) => phone.replace(/[^\d+]/g, '').replace(/^\+/, '');
 
+const applyConversionUpdate = (currentStage: string, updates: Record<string, unknown>) => {
+  if (typeof updates.stage !== 'string') {
+    return updates;
+  }
+
+  if (updates.stage === 'converted' && currentStage !== 'converted') {
+    return { ...updates, convertedAt: new Date() };
+  }
+
+  if (updates.stage !== 'converted' && currentStage === 'converted') {
+    return { ...updates, convertedAt: null };
+  }
+
+  return updates;
+};
+
 const loadOrganizationSettings = async (organizationId: string) => {
   const organization = await prisma.organization.findUnique({
     where: { id: organizationId },
@@ -233,6 +249,8 @@ const handleMessageEvent = async (
   let updatedLead = lead;
   let ruleResult: ReturnType<typeof applyLeadRules> | null = null;
 
+  let appliedUpdates: Record<string, unknown> | null = null;
+
   if (leadRules.length > 0) {
     const messageText = extractMessageText(parsed);
     ruleResult = applyLeadRules(
@@ -251,9 +269,11 @@ const handleMessageEvent = async (
     );
 
     if (Object.keys(ruleResult.updates).length > 0) {
+      const updates = applyConversionUpdate(lead.stage, ruleResult.updates);
+      appliedUpdates = updates;
       updatedLead = await prisma.lead.update({
         where: { id: lead.id },
-        data: ruleResult.updates,
+        data: updates,
       });
     }
   }
@@ -268,8 +288,8 @@ const handleMessageEvent = async (
         conversation,
         matchedRules: ruleResult?.matchedRules ?? [],
         changes:
-          ruleResult && Object.keys(ruleResult.updates).length > 0
-            ? ruleResult.updates
+          appliedUpdates && Object.keys(appliedUpdates).length > 0
+            ? appliedUpdates
             : undefined,
       },
       settings
@@ -306,7 +326,7 @@ const handleMessageEvent = async (
         contact,
         conversation,
         matchedRules: ruleResult.matchedRules,
-        changes: ruleResult.updates,
+        changes: appliedUpdates ?? ruleResult.updates,
       },
       settings
     );
