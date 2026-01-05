@@ -17,13 +17,16 @@ export class QueueFactory {
 
   constructor(config?: QueueConnectionConfig) {
     if (config?.redisUrl) {
-      this.connection = new Redis(config.redisUrl);
+      this.connection = new Redis(config.redisUrl, {
+        maxRetriesPerRequest: null,
+      });
     } else {
       this.connection = new Redis({
         host: config?.host ?? 'localhost',
         port: config?.port ?? 6379,
         password: config?.password,
         db: config?.db ?? 0,
+        maxRetriesPerRequest: null,
       });
     }
   }

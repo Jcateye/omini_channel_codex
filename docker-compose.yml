@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: omini_channel
+      POSTGRES_USER: omini
+      POSTGRES_PASSWORD: omini_dev_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - omini_postgres:/var/lib/postgresql/data
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - omini_redis:/data
+
+volumes:
+  omini_postgres:
+  omini_redis:

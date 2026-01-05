@@ -14,9 +14,11 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.11.1",
+    "@omini/agent-routing": "workspace:*",
     "@omini/core": "workspace:*",
     "@omini/database": "workspace:*",
     "@omini/queue": "workspace:*",
+    "@omini/whatsapp-bsp": "workspace:*",
     "hono": "^4.5.2"
   },
   "devDependencies": {

@@ -24,8 +24,19 @@ export const createQueue = <T = Record<string, unknown>>(name: string) =>
 
 export const createWorker = <T = Record<string, unknown>, R = unknown>(
   name: string,
+  handlerOrConcurrency?: number | ((job: import('./types.js').QueueJobData<T>) => Promise<R>),
   concurrency = 1
-) => queueFactory.createWorker<T, R>(name, concurrency);
+) => {
+  const resolvedConcurrency =
+    typeof handlerOrConcurrency === 'number' ? handlerOrConcurrency : concurrency;
+  const worker = queueFactory.createWorker<T, R>(name, resolvedConcurrency);
+
+  if (typeof handlerOrConcurrency === 'function') {
+    worker.process(handlerOrConcurrency);
+  }
+
+  return worker;
+};
 
 export const defaultJobOptions = {
   attempts: 3,
@@ -40,6 +51,10 @@ export const defaultJobOptions = {
 export const QUEUE_NAMES = {
   inboundEvents: 'inbound.events',
   crmWebhooks: 'crm.webhooks',
+  outboundMessages: 'outbound.messages',
+  statusEvents: 'whatsapp.status',
+  campaignSends: 'campaign.sends',
+  agentReplies: 'agent.replies',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];

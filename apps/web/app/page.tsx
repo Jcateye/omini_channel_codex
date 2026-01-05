@@ -42,6 +42,35 @@ type WebhookDelivery = {
   updatedAt: string;
 };
 
+type Channel = {
+  id: string;
+  name: string;
+  platform: string;
+  provider?: string | null;
+  externalId: string;
+  status: string;
+  credentials?: Record<string, unknown> | null;
+  createdAt: string;
+};
+
+type Message = {
+  id: string;
+  externalId?: string | null;
+  direction: string;
+  status: string;
+  content: Record<string, unknown>;
+  createdAt: string;
+  channel?: {
+    id: string;
+    name: string;
+    provider?: string | null;
+  } | null;
+  contact?: {
+    name?: string | null;
+    phone?: string | null;
+  } | null;
+};
+
 const safeJson = (value: string) => {
   try {
     return { ok: true, data: JSON.parse(value) } as const;
@@ -61,9 +90,40 @@ export default function Home() {
   const [leadsLoading, setLeadsLoading] = useState(false);
   const [leadsError, setLeadsError] = useState('');
 
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [channelsLoading, setChannelsLoading] = useState(false);
+  const [channelsError, setChannelsError] = useState('');
+  const [selectedChannelId, setSelectedChannelId] = useState('');
+
+  const [channelName, setChannelName] = useState('WA MessageBird');
+  const [channelExternalId, setChannelExternalId] = useState('');
+  const [channelProvider, setChannelProvider] = useState('messagebird');
+  const [channelApiKey, setChannelApiKey] = useState('');
+  const [channelFrom, setChannelFrom] = useState('');
+  const [channelSenderId, setChannelSenderId] = useState('');
+  const [channelBaseUrl, setChannelBaseUrl] = useState('');
+  const [channelStatus, setChannelStatus] = useState('');
+  const [channelError, setChannelError] = useState('');
+
+  const [sendChannelId, setSendChannelId] = useState('');
+  const [sendTo, setSendTo] = useState('');
+  const [sendText, setSendText] = useState('Hello from Omini');
+  const [sendStatus, setSendStatus] = useState('');
+  const [sendError, setSendError] = useState('');
+  const [sendResponse, setSendResponse] = useState('');
+
   const [rulesText, setRulesText] = useState('[]');
   const [rulesStatus, setRulesStatus] = useState('');
   const [rulesError, setRulesError] = useState('');
+
+  const [messageStatusFilter, setMessageStatusFilter] = useState('');
+  const [messageChannelFilter, setMessageChannelFilter] = useState('');
+  const [messageLimit, setMessageLimit] = useState(10);
+  const [messageOffset, setMessageOffset] = useState(0);
+  const [messageTotal, setMessageTotal] = useState(0);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [messagesError, setMessagesError] = useState('');
 
   const [signalLeadId, setSignalLeadId] = useState('');
   const [signalText, setSignalText] = useState('ready to buy');
@@ -109,6 +169,28 @@ export default function Home() {
     return base.endsWith('/') ? base.slice(0, -1) : base;
   }, [apiBase]);
 
+  useEffect(() => {
+    if (selectedChannelId) {
+      setSendChannelId(selectedChannelId);
+    }
+  }, [selectedChannelId]);
+
+  const selectedChannel = useMemo(
+    () => channels.find((channel) => channel.id === selectedChannelId) ?? null,
+    [channels, selectedChannelId]
+  );
+
+  const buildWebhookUrl = (path: string) =>
+    resolvedBase ? `${resolvedBase}${path}` : path;
+
+  const selectedProvider = (selectedChannel?.provider ?? channelProvider).toLowerCase();
+  const inboundWebhookUrl = selectedChannelId
+    ? buildWebhookUrl(`/v1/webhooks/whatsapp/${selectedProvider}/${selectedChannelId}`)
+    : '';
+  const statusWebhookUrl = selectedChannelId
+    ? buildWebhookUrl(`/v1/webhooks/whatsapp/${selectedProvider}/${selectedChannelId}/status`)
+    : '';
+
   const apiFetch = async <T,>(path: string, options?: RequestInit): Promise<T> => {
     if (!apiKey) {
       throw new Error('Missing API key');
@@ -150,6 +232,136 @@ export default function Home() {
       setLeadsError(error instanceof Error ? error.message : String(error));
     } finally {
       setLeadsLoading(false);
+    }
+  };
+
+  const loadChannels = async () => {
+    setChannelsError('');
+    setChannelsLoading(true);
+
+    try {
+      const data = await apiFetch<{ channels: Channel[] }>('/v1/channels');
+      const whatsappChannels = (data.channels ?? []).filter(
+        (channel) => channel.platform === 'whatsapp'
+      );
+      setChannels(whatsappChannels);
+      if (!selectedChannelId && whatsappChannels.length > 0) {
+        setSelectedChannelId(whatsappChannels[0].id);
+      }
+    } catch (error) {
+      setChannelsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelsLoading(false);
+    }
+  };
+
+  const createChannel = async () => {
+    setChannelStatus('');
+    setChannelError('');
+
+    const name = channelName.trim();
+    const externalId = channelExternalId.trim();
+    const provider = channelProvider.trim().toLowerCase();
+    const apiKey = channelApiKey.trim();
+    const from = channelFrom.trim();
+    const senderId = channelSenderId.trim();
+    const baseUrl = channelBaseUrl.trim();
+
+    if (!name || !externalId || !provider) {
+      setChannelError('Provide name, external id, and provider.');
+      return;
+    }
+
+    if (!apiKey) {
+      setChannelError('MessageBird API key is required.');
+      return;
+    }
+
+    if (!from && !senderId) {
+      setChannelError('Provide from or channelId.');
+      return;
+    }
+
+    const credentials: Record<string, unknown> = {
+      apiKey,
+    };
+
+    if (from) credentials.from = from;
+    if (senderId) credentials.channelId = senderId;
+    if (baseUrl) credentials.baseUrl = baseUrl;
+
+    try {
+      const data = await apiFetch<{ channel: Channel }>('/v1/channels', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          platform: 'whatsapp',
+          provider,
+          externalId,
+          credentials,
+          settings: { mode: 'live' },
+        }),
+      });
+      setChannels((prev) => [data.channel, ...prev]);
+      setSelectedChannelId(data.channel.id);
+      setChannelStatus('Channel created.');
+    } catch (error) {
+      setChannelError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const sendMessage = async () => {
+    setSendStatus('');
+    setSendError('');
+    setSendResponse('');
+
+    const channelId = sendChannelId.trim();
+    const to = sendTo.trim();
+    const text = sendText.trim();
+
+    if (!channelId || !to || !text) {
+      setSendError('Provide channel id, recipient, and text.');
+      return;
+    }
+
+    try {
+      const data = await apiFetch(`/v1/whatsapp/channels/${channelId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          to,
+          text,
+        }),
+      });
+      setSendResponse(JSON.stringify(data, null, 2));
+      setSendStatus('Message queued.');
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const loadMessages = async (nextOffset = messageOffset) => {
+    setMessagesError('');
+    setMessagesLoading(true);
+
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', String(messageLimit));
+      params.set('offset', String(nextOffset));
+      if (messageStatusFilter.trim()) params.set('status', messageStatusFilter.trim());
+      if (messageChannelFilter.trim()) params.set('channelId', messageChannelFilter.trim());
+
+      const data = await apiFetch<{
+        messages: Message[];
+        total: number;
+      }>(`/v1/messages?${params.toString()}`);
+
+      setMessages(data.messages ?? []);
+      setMessageTotal(data.total ?? 0);
+      setMessageOffset(nextOffset);
+    } catch (error) {
+      setMessagesError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMessagesLoading(false);
     }
   };
 
@@ -316,6 +528,179 @@ export default function Home() {
           </Card>
         </section>
 
+        <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+          <Card className="animate-rise" style={{ animationDelay: '150ms' }}>
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>MessageBird channels</CardTitle>
+                <CardDescription>Configure live WhatsApp channels and view webhook URLs.</CardDescription>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <Button variant="outline" onClick={loadChannels}>
+                  {channelsLoading ? 'Loading...' : 'Load channels'}
+                </Button>
+                {channelsError ? (
+                  <span className="text-xs text-accent2">{channelsError}</span>
+                ) : null}
+              </div>
+
+              <div className="space-y-3">
+                {channels.length === 0 && !channelsLoading ? (
+                  <p className="text-sm text-muted">No WhatsApp channels yet.</p>
+                ) : null}
+                {channels.map((channel) => (
+                  <div
+                    key={channel.id}
+                    className={`rounded-xl border border-ink/10 bg-white/70 p-4 ${
+                      selectedChannelId === channel.id ? 'ring-1 ring-accent/40' : ''
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold">{channel.name}</p>
+                        <p className="text-xs text-muted">{channel.id}</p>
+                        <p className="text-xs text-muted">
+                          Provider: {channel.provider ?? 'unknown'} · External: {channel.externalId}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Badge variant="muted">{channel.status}</Badge>
+                        <Button
+                          size="sm"
+                          variant={selectedChannelId === channel.id ? 'warm' : 'outline'}
+                          onClick={() => setSelectedChannelId(channel.id)}
+                        >
+                          {selectedChannelId === channel.id ? 'Selected' : 'Use'}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="rounded-xl border border-ink/10 bg-ink/[0.02] p-4">
+                <p className="text-sm font-semibold">Create MessageBird channel</p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <Input
+                    placeholder="Channel name"
+                    value={channelName}
+                    onChange={(event) => setChannelName(event.target.value)}
+                  />
+                  <Input
+                    placeholder="External id"
+                    value={channelExternalId}
+                    onChange={(event) => setChannelExternalId(event.target.value)}
+                  />
+                  <Input
+                    placeholder="Provider (messagebird)"
+                    value={channelProvider}
+                    onChange={(event) => setChannelProvider(event.target.value)}
+                  />
+                  <Input
+                    placeholder="API key"
+                    type="password"
+                    value={channelApiKey}
+                    onChange={(event) => setChannelApiKey(event.target.value)}
+                  />
+                  <Input
+                    placeholder="From (phone)"
+                    value={channelFrom}
+                    onChange={(event) => setChannelFrom(event.target.value)}
+                  />
+                  <Input
+                    placeholder="Channel ID (optional)"
+                    value={channelSenderId}
+                    onChange={(event) => setChannelSenderId(event.target.value)}
+                  />
+                  <Input
+                    placeholder="Base URL (optional)"
+                    value={channelBaseUrl}
+                    onChange={(event) => setChannelBaseUrl(event.target.value)}
+                  />
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-3 text-xs">
+                  <Button size="sm" variant="warm" onClick={createChannel}>
+                    Create channel
+                  </Button>
+                  {channelStatus ? (
+                    <span className="text-accent">{channelStatus}</span>
+                  ) : null}
+                  {channelError ? (
+                    <span className="text-accent2">{channelError}</span>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <div className="space-y-2">
+                  <Label>Inbound webhook</Label>
+                  <Input value={inboundWebhookUrl || 'Select a channel'} readOnly />
+                </div>
+                <div className="space-y-2">
+                  <Label>Status webhook</Label>
+                  <Input value={statusWebhookUrl || 'Select a channel'} readOnly />
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          <Card className="animate-rise" style={{ animationDelay: '210ms' }}>
+            <div className="flex h-full flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Send WhatsApp</CardTitle>
+                <CardDescription>Queue a live MessageBird outbound message.</CardDescription>
+              </div>
+
+              <div className="space-y-2">
+                <Label>Channel id</Label>
+                <Input
+                  list="channel-list"
+                  placeholder="channel_id"
+                  value={sendChannelId}
+                  onChange={(event) => setSendChannelId(event.target.value)}
+                />
+                <datalist id="channel-list">
+                  {channels.map((channel) => (
+                    <option key={channel.id} value={channel.id} />
+                  ))}
+                </datalist>
+              </div>
+
+              <div className="space-y-2">
+                <Label>Recipient</Label>
+                <Input
+                  placeholder="+8613xxxx"
+                  value={sendTo}
+                  onChange={(event) => setSendTo(event.target.value)}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label>Message</Label>
+                <Textarea
+                  value={sendText}
+                  onChange={(event) => setSendText(event.target.value)}
+                  className="min-h-[140px]"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <Button onClick={sendMessage}>Send message</Button>
+                {sendStatus ? <span className="text-xs text-accent">{sendStatus}</span> : null}
+                {sendError ? <span className="text-xs text-accent2">{sendError}</span> : null}
+              </div>
+
+              <div className="space-y-2">
+                <Label>Send response</Label>
+                <pre className="min-h-[160px] whitespace-pre-wrap rounded-xl border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
+                  {sendResponse || 'No response yet.'}
+                </pre>
+              </div>
+            </div>
+          </Card>
+        </section>
+
         <section className="grid gap-6 lg:grid-cols-2">
           <Card className="animate-rise" style={{ animationDelay: '180ms' }}>
             <div className="flex flex-col gap-5">
@@ -413,6 +798,125 @@ export default function Home() {
                 </Button>
                 {rulesStatus ? <span className="text-xs text-accent">{rulesStatus}</span> : null}
                 {rulesError ? <span className="text-xs text-accent2">{rulesError}</span> : null}
+              </div>
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+          <Card className="animate-rise" style={{ animationDelay: '330ms' }}>
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Messages</CardTitle>
+                <CardDescription>Track outbound ids and status updates.</CardDescription>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-3">
+                <Input
+                  placeholder="Status (pending, sent, delivered...)"
+                  value={messageStatusFilter}
+                  onChange={(event) => setMessageStatusFilter(event.target.value)}
+                />
+                <Input
+                  placeholder="Channel id"
+                  value={messageChannelFilter}
+                  onChange={(event) => setMessageChannelFilter(event.target.value)}
+                />
+                <Input
+                  placeholder="Limit"
+                  value={String(messageLimit)}
+                  onChange={(event) => {
+                    const parsed = Number(event.target.value);
+                    if (!Number.isNaN(parsed)) {
+                      setMessageLimit(Math.min(200, Math.max(1, parsed)));
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="flex items-center gap-3">
+                <Button variant="outline" onClick={() => loadMessages(0)}>
+                  {messagesLoading ? 'Loading...' : 'Load messages'}
+                </Button>
+                {messagesError ? (
+                  <span className="text-xs text-accent2">{messagesError}</span>
+                ) : null}
+              </div>
+
+              <div className="space-y-3">
+                {messages.length === 0 && !messagesLoading ? (
+                  <p className="text-sm text-muted">No messages loaded yet.</p>
+                ) : null}
+                {messages.map((message) => (
+                  <div
+                    key={message.id}
+                    className="rounded-xl border border-ink/10 bg-white/70 p-4"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold">
+                          {message.contact?.name ||
+                            message.contact?.phone ||
+                            message.channel?.name ||
+                            'Message'}
+                        </p>
+                        <p className="text-xs text-muted">{message.id}</p>
+                      </div>
+                      <Badge variant={message.status === 'failed' ? 'muted' : 'accent'}>
+                        {message.status}
+                      </Badge>
+                    </div>
+                    <div className="mt-3 text-xs text-muted">
+                      <span>External id: {message.externalId ?? '-'}</span>
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted">
+                      <span>Direction: {message.direction}</span>
+                      <span>
+                        Channel: {message.channel?.name ?? 'unknown'} (
+                        {message.channel?.provider ?? 'n/a'})
+                      </span>
+                    </div>
+                    <div className="mt-2 text-xs text-muted">
+                      Created: {message.createdAt}
+                    </div>
+                    <pre className="mt-3 whitespace-pre-wrap rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-xs">
+                      {JSON.stringify(message.content ?? {}, null, 2)}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Card>
+
+          <Card className="animate-rise" style={{ animationDelay: '390ms' }}>
+            <div className="flex h-full flex-col justify-between gap-6">
+              <div className="space-y-1">
+                <CardTitle>Message paging</CardTitle>
+                <CardDescription>Navigate message history.</CardDescription>
+              </div>
+              <div className="space-y-4">
+                <div className="text-sm text-muted">
+                  Offset {messageOffset} · Showing {messages.length} of {messageTotal}
+                </div>
+                <div className="flex gap-3">
+                  <Button
+                    variant="outline"
+                    disabled={messageOffset === 0 || messagesLoading}
+                    onClick={() => loadMessages(Math.max(0, messageOffset - messageLimit))}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={messagesLoading || messageOffset + messageLimit >= messageTotal}
+                    onClick={() => loadMessages(messageOffset + messageLimit)}
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
+              <div className="text-xs text-muted">
+                Tip: filter status like <code>sent</code> or <code>delivered</code>.
               </div>
             </div>
           </Card>

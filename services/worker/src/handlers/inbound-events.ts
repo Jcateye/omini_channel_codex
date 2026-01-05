@@ -1,6 +1,7 @@
 import { applyLeadRules, type LeadRule } from '@omini/core';
 import { prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
+import { getWhatsAppAdapter, type InboundMessage } from '@omini/whatsapp-bsp';
 
 export type InboundWebhookJob = {
   channelId: string;
@@ -9,16 +10,8 @@ export type InboundWebhookJob = {
   headers?: Record<string, string>;
 };
 
-type ParsedMessage = {
-  externalId?: string;
-  senderExternalId: string;
-  senderName?: string;
-  timestamp: Date;
-  text?: string;
-  rawPayload: Record<string, unknown>;
-};
-
 const crmQueue = createQueue(QUEUE_NAMES.crmWebhooks);
+const agentRepliesQueue = createQueue(QUEUE_NAMES.agentReplies);
 
 const normalizePhone = (phone: string) => phone.replace(/[^\d+]/g, '').replace(/^\+/, '');
 
@@ -187,42 +180,14 @@ const findOrCreateLead = async (
 
 const extractMessageText = (message?: ParsedMessage) => message?.text?.trim();
 
-const parseMessageBirdPayload = (payload: Record<string, unknown>): ParsedMessage | null => {
-  if (payload.type !== 'message.created') {
-    return null;
-  }
-
-  const message = payload.message as Record<string, unknown> | undefined;
-  const contact = payload.contact as Record<string, unknown> | undefined;
-
-  if (!message || !contact) {
-    return null;
-  }
-
-  const content = message.content as Record<string, unknown> | undefined;
-  const text = content?.text as string | undefined;
-  const createdDatetime = message.createdDatetime as string | undefined;
-
-  const msisdn = (contact.msisdn as string | undefined) ?? (contact.id as string | undefined);
-  if (!msisdn) {
-    return null;
-  }
-
-  const timestamp = createdDatetime ? new Date(createdDatetime) : new Date();
-
-  return {
-    externalId: message.id as string | undefined,
-    senderExternalId: msisdn,
-    senderName: (contact.displayName as string | undefined) ?? undefined,
-    timestamp,
-    text,
-    rawPayload: payload,
-  };
-};
-
 const handleMessageEvent = async (
-  channel: { id: string; organizationId: string },
-  parsed: ParsedMessage
+  channel: {
+    id: string;
+    organizationId: string;
+    platform: string;
+    provider: string | null;
+  },
+  parsed: InboundMessage
 ) => {
   const settings = await loadOrganizationSettings(channel.organizationId);
   const leadRules = getLeadRulesFromSettings(settings);
@@ -242,7 +207,7 @@ const handleMessageEvent = async (
     lastMessageAt: parsed.timestamp,
   });
 
-  await prisma.message.create({
+  const inboundMessage = await prisma.message.create({
     data: {
       organizationId: channel.organizationId,
       conversationId: conversation.id,
@@ -309,6 +274,26 @@ const handleMessageEvent = async (
       },
       settings
     );
+    await agentRepliesQueue.add(
+      'agent.reply',
+      {
+        context: {
+          organizationId: channel.organizationId,
+          channelId: channel.id,
+          conversationId: conversation.id,
+          contactId: contact.id,
+          leadId: updatedLead.id,
+          messageId: inboundMessage.id,
+          platform: channel.platform,
+          provider: channel.provider,
+          text: parsed.text,
+          tags: updatedLead.tags ?? [],
+          stage: updatedLead.stage,
+          source: updatedLead.source,
+        },
+      },
+      defaultJobOptions
+    );
     return;
   }
 
@@ -326,6 +311,27 @@ const handleMessageEvent = async (
       settings
     );
   }
+
+  await agentRepliesQueue.add(
+    'agent.reply',
+    {
+      context: {
+        organizationId: channel.organizationId,
+        channelId: channel.id,
+        conversationId: conversation.id,
+        contactId: contact.id,
+        leadId: updatedLead.id,
+        messageId: inboundMessage.id,
+        platform: channel.platform,
+        provider: channel.provider,
+        text: parsed.text,
+        tags: updatedLead.tags ?? [],
+        stage: updatedLead.stage,
+        source: updatedLead.source,
+      },
+    },
+    defaultJobOptions
+  );
 };
 
 export const registerInboundEventsWorker = () =>
@@ -346,7 +352,16 @@ export const registerInboundEventsWorker = () =>
       return;
     }
 
-    const parsed = parseMessageBirdPayload(data.payload);
+    if (!channel.provider) {
+      throw new Error(`Channel ${channel.id} missing provider`);
+    }
+
+    const adapter = getWhatsAppAdapter(channel.provider.toLowerCase());
+    if (!adapter) {
+      throw new Error(`Unsupported WhatsApp provider: ${channel.provider}`);
+    }
+
+    const parsed = adapter.parseInbound(data.payload);
     if (!parsed) {
       return;
     }

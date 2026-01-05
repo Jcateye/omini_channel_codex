@@ -58,6 +58,22 @@ enum WebhookDeliveryStatus {
   failed
 }
 
+enum CampaignStatus {
+  draft
+  scheduled
+  running
+  completed
+  failed
+  canceled
+}
+
+enum CampaignSendStatus {
+  queued
+  sent
+  failed
+  skipped
+}
+
 model Organization {
   id        String   @id @default(uuid())
   name      String
@@ -73,6 +89,9 @@ model Organization {
   conversations      Conversation[]
   messages           Message[]
   leads              Lead[]
+  campaigns          Campaign[]
+  campaignSegments   CampaignSegment[]
+  campaignSends      CampaignSend[]
   webhookDeliveries  WebhookDelivery[]
 }
 
@@ -108,6 +127,7 @@ model Channel {
   organization Organization  @relation(fields: [organizationId], references: [id])
   conversations Conversation[]
   messages      Message[]
+  campaigns     Campaign[]
 
   @@index([organizationId])
   @@unique([organizationId, platform, externalId])
@@ -195,6 +215,7 @@ model Message {
   conversation Conversation @relation(fields: [conversationId], references: [id])
   channel      Channel      @relation(fields: [channelId], references: [id])
   contact      Contact      @relation(fields: [contactId], references: [id])
+  campaignSends CampaignSend[]
 
   @@index([organizationId])
   @@index([conversationId])
@@ -219,9 +240,77 @@ model Lead {
   organization Organization @relation(fields: [organizationId], references: [id])
   contact      Contact?     @relation(fields: [contactId], references: [id])
   conversation Conversation? @relation(fields: [conversationId], references: [id])
+  campaignSends CampaignSend[]
 
   @@index([organizationId])
   @@index([contactId])
+}
+
+model Campaign {
+  id             String         @id @default(uuid())
+  organizationId String
+  channelId      String
+  name           String
+  messageText    String
+  status         CampaignStatus @default(draft)
+  scheduledAt    DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  totalQueued    Int            @default(0)
+  totalSent      Int            @default(0)
+  totalFailed    Int            @default(0)
+  totalSkipped   Int            @default(0)
+  segmentId      String?        @unique
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  organization Organization   @relation(fields: [organizationId], references: [id])
+  channel      Channel        @relation(fields: [channelId], references: [id])
+  segment      CampaignSegment? @relation(fields: [segmentId], references: [id])
+  sends        CampaignSend[]
+
+  @@index([organizationId])
+  @@index([channelId])
+  @@index([status])
+  @@index([scheduledAt])
+}
+
+model CampaignSegment {
+  id                   String   @id @default(uuid())
+  organizationId       String
+  stages               LeadStage[] @default([])
+  tagsAll              String[] @default([])
+  sources              String[] @default([])
+  lastActiveWithinDays Int?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  campaign     Campaign?
+
+  @@index([organizationId])
+}
+
+model CampaignSend {
+  id             String            @id @default(uuid())
+  organizationId String
+  campaignId     String
+  leadId         String
+  messageId      String?
+  status         CampaignSendStatus @default(queued)
+  errorMessage   String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  campaign     Campaign     @relation(fields: [campaignId], references: [id])
+  lead         Lead         @relation(fields: [leadId], references: [id])
+  message      Message?     @relation(fields: [messageId], references: [id])
+
+  @@index([organizationId])
+  @@index([campaignId])
+  @@index([leadId])
+  @@unique([campaignId, leadId])
 }
 
 model WebhookDelivery {

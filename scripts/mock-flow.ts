@@ -122,6 +122,7 @@ const ensureLeadRules = async () => {
 type Channel = {
   id: string;
   platform: string;
+  provider?: string | null;
   settings?: Record<string, unknown> | null;
   credentials?: Record<string, unknown> | null;
 };
@@ -135,6 +136,7 @@ const pickOrCreateChannel = async () => {
   const mockChannel = existing.channels.find(
     (channel) =>
       channel.platform === 'whatsapp' &&
+      channel.provider === 'messagebird' &&
       (channel.settings?.mock === true || channel.credentials?.mock === true)
   );
 

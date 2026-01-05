@@ -5,8 +5,11 @@ import { Hono } from 'hono';
 import type { Prisma } from '@prisma/client';
 
 import { applyLeadRules, type LeadRule } from '@omini/core';
+import type { AgentRoutingConfig, AgentRoutingRule } from '@omini/agent-routing';
+import { listAgentAdapters, selectAgent } from '@omini/agent-routing';
 import { prisma } from '@omini/database';
 import { createQueue, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
+import { getWhatsAppAdapter } from '@omini/whatsapp-bsp';
 
 import { createApiKey } from './auth.js';
 import { tenantAuth } from './middleware/tenant-auth.js';
@@ -24,10 +27,14 @@ const admin = new Hono();
 
 const inboundQueue = createQueue(QUEUE_NAMES.inboundEvents);
 const crmQueue = createQueue(QUEUE_NAMES.crmWebhooks);
+const outboundQueue = createQueue(QUEUE_NAMES.outboundMessages);
+const statusQueue = createQueue(QUEUE_NAMES.statusEvents);
 
 const leadStages = new Set(['new', 'qualified', 'nurtured', 'converted', 'lost']);
 const supportedPlatforms = new Set(['whatsapp', 'twitter', 'instagram', 'tiktok']);
 const webhookStatuses = new Set(['pending', 'success', 'failed']);
+const messageStatuses = new Set(['pending', 'sent', 'delivered', 'read', 'failed']);
+const campaignStatuses = new Set(['draft', 'scheduled', 'running', 'completed', 'failed', 'canceled']);
 
 const createTrackingToken = () => crypto.randomBytes(16).toString('hex');
 
@@ -38,6 +45,39 @@ const loadOrganizationSettings = async (organizationId: string) => {
   });
 
   return (organization?.settings as Record<string, unknown>) ?? {};
+};
+
+const getAgentRoutingConfig = (settings: Record<string, unknown>): AgentRoutingConfig => {
+  const raw = settings.agentRouting;
+  if (!raw || typeof raw !== 'object') {
+    return { rules: [] };
+  }
+
+  const config = raw as Record<string, unknown>;
+  const rules = Array.isArray(config.rules)
+    ? (config.rules.filter((rule) => rule && typeof rule === 'object') as AgentRoutingRule[])
+    : [];
+
+  return {
+    defaultAgentId: typeof config.defaultAgentId === 'string' ? config.defaultAgentId : undefined,
+    rules,
+  };
+};
+
+const normalizeAgentRoutingConfig = (input: unknown): AgentRoutingConfig => {
+  if (!input || typeof input !== 'object') {
+    return { rules: [] };
+  }
+
+  const config = input as Record<string, unknown>;
+  const rules = Array.isArray(config.rules)
+    ? (config.rules.filter((rule) => rule && typeof rule === 'object') as AgentRoutingRule[])
+    : [];
+
+  return {
+    defaultAgentId: typeof config.defaultAgentId === 'string' ? config.defaultAgentId : undefined,
+    rules,
+  };
 };
 
 const getLeadRulesFromSettings = (settings: Record<string, unknown>): LeadRule[] => {
@@ -84,6 +124,66 @@ const normalizeTags = (input: unknown) => {
     .map((tag) => tag.trim())
     .filter((tag) => tag.length > 0);
 };
+
+const normalizeStringList = (input: unknown) => {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .filter((value) => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+};
+
+const normalizeCampaignSegment = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return {
+      stages: [],
+      tagsAll: [],
+      sources: [],
+      lastActiveWithinDays: null,
+    };
+  }
+
+  const segment = input as Record<string, unknown>;
+
+  const stages = normalizeStringList(segment.stages).filter((stage) => leadStages.has(stage));
+  const tagsAll = normalizeStringList(segment.tags);
+  const sources = normalizeStringList(segment.sources);
+  const lastActiveWithinDays =
+    typeof segment.lastActiveWithinDays === 'number' && segment.lastActiveWithinDays > 0
+      ? Math.floor(segment.lastActiveWithinDays)
+      : null;
+
+  return { stages, tagsAll, sources, lastActiveWithinDays };
+};
+
+const buildSegmentWhere = (
+  organizationId: string,
+  segment: ReturnType<typeof normalizeCampaignSegment>
+): Prisma.LeadWhereInput => {
+  const where: Prisma.LeadWhereInput = {
+    organizationId,
+    ...(segment.stages.length > 0
+      ? { stage: { in: segment.stages as Prisma.LeadStage[] } }
+      : {}),
+    ...(segment.tagsAll.length > 0 ? { tags: { hasEvery: segment.tagsAll } } : {}),
+    ...(segment.sources.length > 0 ? { source: { in: segment.sources } } : {}),
+  };
+
+  if (segment.lastActiveWithinDays) {
+    const cutoff = new Date(Date.now() - segment.lastActiveWithinDays * 24 * 60 * 60 * 1000);
+    where.OR = [
+      { lastActivityAt: { gte: cutoff } },
+      { lastActivityAt: null, createdAt: { gte: cutoff } },
+    ];
+  }
+
+  return where;
+};
+
+const normalizePhone = (phone: string) => phone.replace(/[^\d+]/g, '').replace(/^\+/, '');
 
 const shouldSendCrmEvent = (settings: Record<string, unknown>, eventType: string) => {
   const raw = settings.crmWebhook as Record<string, unknown> | undefined;
@@ -195,34 +295,117 @@ const upsertConversation = async (input: {
   });
 };
 
-const buildMessageBirdMockMessagePayload = (input: {
-  from: string;
-  name?: string;
-  text: string;
-  messageId?: string;
-  timestamp?: Date;
-}) => {
-  const createdAt = input.timestamp ?? new Date();
-
-  return {
-    type: 'message.created',
-    message: {
-      id: input.messageId ?? `mock_${crypto.randomUUID()}`,
-      createdDatetime: createdAt.toISOString(),
-      content: {
-        type: 'text',
-        text: input.text,
-      },
-    },
-    contact: {
-      id: input.from,
-      msisdn: input.from,
-      displayName: input.name,
-    },
-  };
-};
-
 app.get('/health', (c) => c.json({ status: 'ok' }));
+
+app.post('/v1/webhooks/whatsapp/:provider/:channelId', async (c) => {
+  const provider = c.req.param('provider').toLowerCase();
+  const channelId = c.req.param('channelId');
+
+  const rawBody = await c.req.text();
+  let payload: Record<string, unknown>;
+
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const channel = await prisma.channel.findUnique({
+    where: { id: channelId },
+  });
+
+  if (!channel) {
+    return c.json({ error: 'channel_not_found' }, 404);
+  }
+
+  if (channel.platform !== 'whatsapp') {
+    return c.json({ error: 'unsupported_platform' }, 400);
+  }
+
+  if (!channel.provider) {
+    return c.json({ error: 'provider_required' }, 400);
+  }
+
+  const channelProvider = channel.provider.toLowerCase();
+  if (channelProvider !== provider) {
+    return c.json({ error: 'provider_mismatch' }, 400);
+  }
+
+  const adapter = getWhatsAppAdapter(provider);
+  if (!adapter) {
+    return c.json({ error: 'unsupported_provider' }, 400);
+  }
+
+  const headers = Object.fromEntries(c.req.raw.headers.entries());
+
+  await inboundQueue.add(
+    'wa.webhook.live',
+    {
+      channelId,
+      payload,
+      rawBody,
+      headers,
+    },
+    defaultJobOptions
+  );
+
+  return c.json({ queued: true });
+});
+
+app.post('/v1/webhooks/whatsapp/:provider/:channelId/status', async (c) => {
+  const provider = c.req.param('provider').toLowerCase();
+  const channelId = c.req.param('channelId');
+
+  const rawBody = await c.req.text();
+  let payload: Record<string, unknown>;
+
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const channel = await prisma.channel.findUnique({
+    where: { id: channelId },
+  });
+
+  if (!channel) {
+    return c.json({ error: 'channel_not_found' }, 404);
+  }
+
+  if (channel.platform !== 'whatsapp') {
+    return c.json({ error: 'unsupported_platform' }, 400);
+  }
+
+  if (!channel.provider) {
+    return c.json({ error: 'provider_required' }, 400);
+  }
+
+  const channelProvider = channel.provider.toLowerCase();
+  if (channelProvider !== provider) {
+    return c.json({ error: 'provider_mismatch' }, 400);
+  }
+
+  const adapter = getWhatsAppAdapter(provider);
+  if (!adapter?.parseStatus) {
+    return c.json({ error: 'unsupported_provider' }, 400);
+  }
+
+  const headers = Object.fromEntries(c.req.raw.headers.entries());
+
+  await statusQueue.add(
+    'wa.status',
+    {
+      channelId,
+      payload,
+      rawBody,
+      headers,
+    },
+    defaultJobOptions
+  );
+
+  return c.json({ queued: true });
+});
 
 api.use('*', tenantAuth);
 
@@ -257,6 +440,48 @@ api.put('/v1/lead-rules', async (c) => {
   });
 
   return c.json({ leadRules });
+});
+
+api.get('/v1/agent-routing', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const config = getAgentRoutingConfig(settings);
+
+  return c.json({ config, adapters: listAgentAdapters() });
+});
+
+api.put('/v1/agent-routing', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const config = normalizeAgentRoutingConfig(body);
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        agentRouting: config,
+      },
+    },
+  });
+
+  return c.json({ config });
+});
+
+api.post('/v1/agent-routing/test', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const config = getAgentRoutingConfig(settings);
+
+  const decision = selectAgent(config, {
+    platform: typeof body.platform === 'string' ? body.platform : undefined,
+    provider: typeof body.provider === 'string' ? body.provider : undefined,
+    stage: typeof body.stage === 'string' ? body.stage : undefined,
+    source: typeof body.source === 'string' ? body.source : undefined,
+    tags: Array.isArray(body.tags) ? (body.tags as string[]) : undefined,
+    text: typeof body.text === 'string' ? body.text : undefined,
+  });
+
+  return c.json({ decision });
 });
 
 api.get('/v1/crm/webhook', async (c) => {
@@ -476,6 +701,214 @@ api.get('/v1/webhook-deliveries', async (c) => {
   return c.json({ deliveries, total, limit, offset });
 });
 
+api.get('/v1/messages', async (c) => {
+  const statusQuery = c.req.query('status');
+  const channelQuery = c.req.query('channelId');
+  const limitRaw = c.req.query('limit');
+  const offsetRaw = c.req.query('offset');
+
+  const parseNumber = (value: string | undefined, fallback: number) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const limit = Math.min(200, Math.max(1, parseNumber(limitRaw, 50)));
+  const offset = Math.max(0, parseNumber(offsetRaw, 0));
+
+  const statuses = statusQuery
+    ? statusQuery
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => messageStatuses.has(value))
+    : [];
+
+  const channelIds = channelQuery
+    ? channelQuery
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0)
+    : [];
+
+  const where: Prisma.MessageWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(statuses.length > 0 ? { status: { in: statuses } } : {}),
+    ...(channelIds.length > 0 ? { channelId: { in: channelIds } } : {}),
+  };
+
+  const [messages, total] = await Promise.all([
+    prisma.message.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+      include: {
+        channel: true,
+        contact: true,
+      },
+    }),
+    prisma.message.count({ where }),
+  ]);
+
+  return c.json({ messages, total, limit, offset });
+});
+
+api.get('/v1/campaigns', async (c) => {
+  const statusQuery = c.req.query('status');
+  const channelQuery = c.req.query('channelId');
+  const limitRaw = c.req.query('limit');
+  const offsetRaw = c.req.query('offset');
+
+  const parseNumber = (value: string | undefined, fallback: number) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const limit = Math.min(200, Math.max(1, parseNumber(limitRaw, 50)));
+  const offset = Math.max(0, parseNumber(offsetRaw, 0));
+
+  const statuses = statusQuery
+    ? statusQuery
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => campaignStatuses.has(value))
+    : [];
+
+  const channelIds = channelQuery
+    ? channelQuery
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0)
+    : [];
+
+  const where: Prisma.CampaignWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(statuses.length > 0 ? { status: { in: statuses as Prisma.CampaignStatus[] } } : {}),
+    ...(channelIds.length > 0 ? { channelId: { in: channelIds } } : {}),
+  };
+
+  const [campaigns, total] = await Promise.all([
+    prisma.campaign.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+      include: { segment: true, channel: true },
+    }),
+    prisma.campaign.count({ where }),
+  ]);
+
+  return c.json({ campaigns, total, limit, offset });
+});
+
+api.post('/v1/campaigns/preview', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const segment = normalizeCampaignSegment(body.segment);
+
+  const where = buildSegmentWhere(c.get('tenantId'), segment);
+  const count = await prisma.lead.count({ where });
+
+  return c.json({ count, segment });
+});
+
+api.post('/v1/campaigns', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const channelId = typeof body.channelId === 'string' ? body.channelId.trim() : '';
+  const messageText = typeof body.messageText === 'string' ? body.messageText.trim() : '';
+  const scheduledAtRaw = body.scheduledAt;
+
+  if (!name || !channelId || !messageText) {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const channel = await prisma.channel.findFirst({
+    where: { id: channelId, organizationId: c.get('tenantId') },
+  });
+
+  if (!channel) {
+    return c.json({ error: 'channel_not_found' }, 404);
+  }
+
+  if (channel.platform !== 'whatsapp') {
+    return c.json({ error: 'unsupported_platform' }, 400);
+  }
+
+  let scheduledAt: Date | undefined;
+  if (typeof scheduledAtRaw === 'string' || typeof scheduledAtRaw === 'number') {
+    const parsed = new Date(scheduledAtRaw);
+    if (Number.isNaN(parsed.getTime())) {
+      return c.json({ error: 'invalid_schedule' }, 400);
+    }
+    scheduledAt = parsed;
+  }
+
+  const segmentInput = normalizeCampaignSegment(body.segment);
+
+  const campaign = await prisma.$transaction(async (tx) => {
+    const segment = await tx.campaignSegment.create({
+      data: {
+        organizationId: c.get('tenantId'),
+        stages: segmentInput.stages as Prisma.LeadStage[],
+        tagsAll: segmentInput.tagsAll,
+        sources: segmentInput.sources,
+        lastActiveWithinDays: segmentInput.lastActiveWithinDays,
+      },
+    });
+
+    return tx.campaign.create({
+      data: {
+        organizationId: c.get('tenantId'),
+        channelId: channel.id,
+        name,
+        messageText,
+        status: scheduledAt ? 'scheduled' : 'draft',
+        scheduledAt,
+        segmentId: segment.id,
+      },
+      include: { segment: true, channel: true },
+    });
+  });
+
+  return c.json({ campaign }, 201);
+});
+
+api.post('/v1/campaigns/:id/schedule', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const scheduledAtRaw = body.scheduledAt;
+
+  let scheduledAt: Date | null = null;
+  if (typeof scheduledAtRaw === 'string' || typeof scheduledAtRaw === 'number') {
+    const parsed = new Date(scheduledAtRaw);
+    if (Number.isNaN(parsed.getTime())) {
+      return c.json({ error: 'invalid_schedule' }, 400);
+    }
+    scheduledAt = parsed;
+  }
+
+  if (!scheduledAt) {
+    return c.json({ error: 'invalid_schedule' }, 400);
+  }
+
+  const campaign = await prisma.campaign.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!campaign) {
+    return c.json({ error: 'campaign_not_found' }, 404);
+  }
+
+  const updated = await prisma.campaign.update({
+    where: { id: campaign.id },
+    data: {
+      scheduledAt,
+      status: 'scheduled',
+    },
+    include: { segment: true, channel: true },
+  });
+
+  return c.json({ campaign: updated });
+});
+
 api.get('/v1/channels', async (c) => {
   const channels = await prisma.channel.findMany({
     where: { organizationId: c.get('tenantId') },
@@ -513,6 +946,87 @@ api.post('/v1/channels', async (c) => {
   return c.json({ channel }, 201);
 });
 
+api.post('/v1/whatsapp/channels/:channelId/messages', async (c) => {
+  const channelId = c.req.param('channelId');
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+
+  const rawTo = typeof body.to === 'string' ? body.to.trim() : '';
+  const rawText = typeof body.text === 'string' ? body.text.trim() : '';
+  const name = typeof body.name === 'string' ? body.name.trim() : undefined;
+
+  if (!rawTo || !rawText) {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const channel = await prisma.channel.findFirst({
+    where: { id: channelId, organizationId: c.get('tenantId') },
+  });
+
+  if (!channel) {
+    return c.json({ error: 'channel_not_found' }, 404);
+  }
+
+  if (channel.platform !== 'whatsapp') {
+    return c.json({ error: 'unsupported_platform' }, 400);
+  }
+
+  if (!channel.provider) {
+    return c.json({ error: 'provider_required' }, 400);
+  }
+
+  const adapter = getWhatsAppAdapter(channel.provider.toLowerCase());
+  if (!adapter?.sendText) {
+    return c.json({ error: 'unsupported_provider' }, 400);
+  }
+
+  const normalizedTo = normalizePhone(rawTo);
+  if (!normalizedTo) {
+    return c.json({ error: 'invalid_recipient' }, 400);
+  }
+
+  const contact = await findOrCreateContact({
+    organizationId: c.get('tenantId'),
+    platform: 'whatsapp',
+    externalId: normalizedTo,
+    name,
+  });
+
+  const conversation = await upsertConversation({
+    organizationId: c.get('tenantId'),
+    channelId: channel.id,
+    contactId: contact.id,
+    platform: 'whatsapp',
+    externalId: normalizedTo,
+  });
+
+  const message = await prisma.message.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      conversationId: conversation.id,
+      channelId: channel.id,
+      contactId: contact.id,
+      platform: 'whatsapp',
+      type: 'text',
+      direction: 'outbound',
+      status: 'pending',
+      content: {
+        text: rawText,
+        to: normalizedTo,
+      },
+    },
+  });
+
+  await outboundQueue.add(
+    'wa.send',
+    {
+      messageId: message.id,
+    },
+    defaultJobOptions
+  );
+
+  return c.json({ message }, 202);
+});
+
 api.post('/v1/mock/whatsapp/inbound', async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
   const channelId = body.channelId as string | undefined;
@@ -535,6 +1049,20 @@ api.post('/v1/mock/whatsapp/inbound', async (c) => {
     return c.json({ error: 'unsupported_platform' }, 400);
   }
 
+  const provider = channel.provider.toLowerCase();
+  if (!provider) {
+    return c.json({ error: 'provider_required' }, 400);
+  }
+
+  const adapter = getWhatsAppAdapter(provider);
+  if (!adapter) {
+    return c.json({ error: 'unsupported_provider' }, 400);
+  }
+
+  if (!adapter.buildMockPayload) {
+    return c.json({ error: 'provider_mock_unsupported' }, 400);
+  }
+
   let timestamp: Date | undefined;
   if (typeof body.timestamp === 'string' || typeof body.timestamp === 'number') {
     const parsed = new Date(body.timestamp);
@@ -544,7 +1072,7 @@ api.post('/v1/mock/whatsapp/inbound', async (c) => {
     timestamp = parsed;
   }
 
-  const payload = buildMessageBirdMockMessagePayload({
+  const payload = adapter.buildMockPayload({
     from,
     name: typeof body.name === 'string' ? body.name : undefined,
     text,

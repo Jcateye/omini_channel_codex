@@ -13,9 +13,11 @@
     "clean": "rm -rf dist .turbo"
   },
   "dependencies": {
+    "@omini/agent-routing": "workspace:*",
     "@omini/core": "workspace:*",
     "@omini/database": "workspace:*",
-    "@omini/queue": "workspace:*"
+    "@omini/queue": "workspace:*",
+    "@omini/whatsapp-bsp": "workspace:*"
   },
   "devDependencies": {
     "tsx": "^4.19.2",

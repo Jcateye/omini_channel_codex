@@ -28,7 +28,11 @@
       "@omini/database": ["packages/database/src"],
       "@omini/database/*": ["packages/database/src/*"],
       "@omini/queue": ["packages/queue/src"],
-      "@omini/queue/*": ["packages/queue/src/*"]
+      "@omini/queue/*": ["packages/queue/src/*"],
+      "@omini/agent-routing": ["packages/agent-routing/src"],
+      "@omini/agent-routing/*": ["packages/agent-routing/src/*"],
+      "@omini/whatsapp-bsp": ["packages/whatsapp-bsp/src"],
+      "@omini/whatsapp-bsp/*": ["packages/whatsapp-bsp/src/*"]
     }
   },
   "exclude": ["node_modules", "dist", ".turbo"]
