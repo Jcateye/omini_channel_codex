@@ -37,6 +37,41 @@ type SignalResponse = {
   updates?: Record<string, unknown>;
 };
 
+type AgentRun = {
+  id: string;
+  type: string;
+  status: string;
+  input?: Record<string, unknown> | null;
+  output?: Record<string, unknown> | null;
+  createdAt: string;
+};
+
+type AgentRunStep = {
+  id: string;
+  stepIndex: number;
+  stepType: string;
+  status: string;
+  input?: Record<string, unknown> | null;
+  output?: Record<string, unknown> | null;
+  startedAt: string;
+  finishedAt?: string | null;
+};
+
+type Optimization = {
+  id: string;
+  type: string;
+  title: string;
+  description: string;
+  status: string;
+  metrics?: Record<string, unknown> | null;
+  createdAt: string;
+  campaign?: {
+    id: string;
+    name: string;
+    status?: string | null;
+  } | null;
+};
+
 const normalizeTags = (input: string) =>
   input
     .split(',')
@@ -53,6 +88,19 @@ export default function LeadDetailPage() {
   const [lead, setLead] = useState<Lead | null>(null);
   const [leadError, setLeadError] = useState('');
   const [leadLoading, setLeadLoading] = useState(false);
+
+  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
+  const [agentRunsLoading, setAgentRunsLoading] = useState(false);
+  const [agentRunsError, setAgentRunsError] = useState('');
+  const [selectedRunId, setSelectedRunId] = useState('');
+  const [runSteps, setRunSteps] = useState<AgentRunStep[]>([]);
+  const [runStepsError, setRunStepsError] = useState('');
+
+  const [optimizations, setOptimizations] = useState<Optimization[]>([]);
+  const [optimizationsLoading, setOptimizationsLoading] = useState(false);
+  const [optimizationsError, setOptimizationsError] = useState('');
+  const [optimizationStatusFilter, setOptimizationStatusFilter] = useState('pending');
+  const [optimizationCampaignFilter, setOptimizationCampaignFilter] = useState('');
 
   const [signalTags, setSignalTags] = useState('purchase');
   const [signalText, setSignalText] = useState('ready to buy');
@@ -104,6 +152,86 @@ export default function LeadDetailPage() {
     }
 
     return data;
+  };
+
+  const loadAgentRuns = async () => {
+    if (!leadId) {
+      setAgentRunsError('Missing lead id.');
+      return;
+    }
+
+    setAgentRunsError('');
+    setAgentRunsLoading(true);
+    try {
+      const data = await apiFetch<{ runs: AgentRun[] }>(
+        `/v1/agent/runs?leadId=${encodeURIComponent(leadId)}`
+      );
+      const runs = data.runs ?? [];
+      setAgentRuns(runs);
+      if (!selectedRunId && runs.length > 0) {
+        setSelectedRunId(runs[0].id);
+      }
+    } catch (error) {
+      setAgentRunsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAgentRunsLoading(false);
+    }
+  };
+
+  const loadRunSteps = async (runId: string) => {
+    if (!runId) {
+      setRunSteps([]);
+      return;
+    }
+    setRunStepsError('');
+    try {
+      const data = await apiFetch<{ steps: AgentRunStep[] }>(
+        `/v1/agent/runs/${runId}/steps`
+      );
+      setRunSteps(data.steps ?? []);
+    } catch (error) {
+      setRunStepsError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const loadOptimizations = async () => {
+    setOptimizationsError('');
+    setOptimizationsLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (optimizationStatusFilter.trim()) {
+        params.set('status', optimizationStatusFilter.trim());
+      }
+      if (optimizationCampaignFilter.trim()) {
+        params.set('campaignId', optimizationCampaignFilter.trim());
+      }
+      const data = await apiFetch<{ optimizations: Optimization[] }>(
+        `/v1/agent/optimizations${params.toString() ? `?${params.toString()}` : ''}`
+      );
+      setOptimizations(data.optimizations ?? []);
+    } catch (error) {
+      setOptimizationsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOptimizationsLoading(false);
+    }
+  };
+
+  const applyOptimization = async (id: string) => {
+    try {
+      await apiFetch(`/v1/agent/optimizations/${id}/apply`, { method: 'POST' });
+      await loadOptimizations();
+    } catch (error) {
+      setOptimizationsError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const dismissOptimization = async (id: string) => {
+    try {
+      await apiFetch(`/v1/agent/optimizations/${id}/dismiss`, { method: 'POST' });
+      await loadOptimizations();
+    } catch (error) {
+      setOptimizationsError(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const loadLead = async () => {
@@ -164,6 +292,7 @@ export default function LeadDetailPage() {
 
       setSignalResponse(JSON.stringify(data, null, 2));
       setSignalStatus('Signals delivered.');
+      await loadAgentRuns();
     } catch (error) {
       setSignalError(error instanceof Error ? error.message : String(error));
     }
@@ -172,8 +301,16 @@ export default function LeadDetailPage() {
   useEffect(() => {
     if (apiKey && leadId) {
       void loadLead();
+      void loadAgentRuns();
+      void loadOptimizations();
     }
   }, [apiKey, leadId]);
+
+  useEffect(() => {
+    if (apiKey && selectedRunId) {
+      void loadRunSteps(selectedRunId);
+    }
+  }, [apiKey, selectedRunId]);
 
   return (
     <main className="min-h-screen px-6 py-12">
@@ -309,6 +446,160 @@ export default function LeadDetailPage() {
                 <pre className="min-h-[180px] whitespace-pre-wrap rounded-xl border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
                   {signalResponse || 'No response yet.'}
                 </pre>
+              </div>
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+          <Card className="animate-rise" style={{ animationDelay: '300ms' }}>
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Agent runs</CardTitle>
+                <CardDescription>Agent scoring/distribution execution traces.</CardDescription>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button variant="outline" onClick={loadAgentRuns}>
+                  {agentRunsLoading ? 'Loading...' : 'Load runs'}
+                </Button>
+                {agentRunsError ? (
+                  <span className="text-xs text-accent2">{agentRunsError}</span>
+                ) : null}
+              </div>
+              <div className="space-y-3">
+                {agentRuns.length === 0 ? (
+                  <p className="text-sm text-muted">No agent runs yet.</p>
+                ) : null}
+                {agentRuns.map((run) => (
+                  <button
+                    key={run.id}
+                    type="button"
+                    onClick={() => setSelectedRunId(run.id)}
+                    className={`flex w-full flex-col gap-1 rounded-xl border border-ink/10 p-4 text-left transition ${
+                      selectedRunId === run.id ? 'bg-white/80 ring-1 ring-accent/40' : 'bg-white/60'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-semibold">{run.type}</span>
+                      <Badge variant={run.status === 'completed' ? 'accent' : 'muted'}>
+                        {run.status}
+                      </Badge>
+                    </div>
+                    <div className="text-xs text-muted">Run id: {run.id}</div>
+                    <div className="text-xs text-muted">Created: {run.createdAt}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </Card>
+
+          <Card className="animate-rise" style={{ animationDelay: '360ms' }}>
+            <div className="flex h-full flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Run steps</CardTitle>
+                <CardDescription>Selected run execution details.</CardDescription>
+              </div>
+              {runStepsError ? (
+                <span className="text-xs text-accent2">{runStepsError}</span>
+              ) : null}
+              <div className="space-y-3">
+                {runSteps.length === 0 ? (
+                  <p className="text-sm text-muted">Select a run to view steps.</p>
+                ) : null}
+                {runSteps.map((step) => (
+                  <div
+                    key={step.id}
+                    className="rounded-xl border border-ink/10 bg-white/70 p-4"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold">
+                          Step {step.stepIndex + 1}: {step.stepType}
+                        </p>
+                        <p className="text-xs text-muted">{step.id}</p>
+                      </div>
+                      <Badge variant={step.status === 'completed' ? 'accent' : 'muted'}>
+                        {step.status}
+                      </Badge>
+                    </div>
+                    <div className="mt-2 text-xs text-muted">
+                      Started: {step.startedAt}
+                    </div>
+                    {step.output ? (
+                      <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
+                        {JSON.stringify(step.output ?? {}, null, 2)}
+                      </pre>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6">
+          <Card className="animate-rise" style={{ animationDelay: '420ms' }}>
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Campaign optimizations</CardTitle>
+                <CardDescription>Latest optimization recommendations.</CardDescription>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Input
+                  placeholder="status (pending/applied)"
+                  value={optimizationStatusFilter}
+                  onChange={(event) => setOptimizationStatusFilter(event.target.value)}
+                />
+                <Input
+                  placeholder="campaign id (optional)"
+                  value={optimizationCampaignFilter}
+                  onChange={(event) => setOptimizationCampaignFilter(event.target.value)}
+                />
+                <Button variant="outline" onClick={loadOptimizations}>
+                  {optimizationsLoading ? 'Loading...' : 'Load'}
+                </Button>
+              </div>
+              {optimizationsError ? (
+                <span className="text-xs text-accent2">{optimizationsError}</span>
+              ) : null}
+              <div className="space-y-3">
+                {optimizations.length === 0 ? (
+                  <p className="text-sm text-muted">No optimizations yet.</p>
+                ) : null}
+                {optimizations.map((opt) => (
+                  <div
+                    key={opt.id}
+                    className="rounded-xl border border-ink/10 bg-white/70 p-4"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold">{opt.title}</p>
+                        <p className="text-xs text-muted">{opt.description}</p>
+                      </div>
+                      <Badge variant={opt.status === 'pending' ? 'accent' : 'muted'}>
+                        {opt.status}
+                      </Badge>
+                    </div>
+                    <div className="mt-2 text-xs text-muted">
+                      Campaign: {opt.campaign?.name ?? opt.campaign?.id ?? 'Unknown'}
+                    </div>
+                    {opt.metrics ? (
+                      <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
+                        {JSON.stringify(opt.metrics, null, 2)}
+                      </pre>
+                    ) : null}
+                    {opt.status === 'pending' ? (
+                      <div className="mt-3 flex gap-2">
+                        <Button size="sm" onClick={() => applyOptimization(opt.id)}>
+                          Apply
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={() => dismissOptimization(opt.id)}>
+                          Dismiss
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
               </div>
             </div>
           </Card>

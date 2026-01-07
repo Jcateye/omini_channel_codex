@@ -48,3 +48,21 @@ export type RoutingDecision = {
   agentId?: string;
   matchedRuleId?: string;
 };
+
+export type AgentPlanType = 'lead_scoring' | 'campaign_optimization';
+
+export type AgentPlanStep = {
+  id: string;
+  type: 'memory' | 'retrieval' | 'scoring' | 'distribution' | 'recommendation' | 'tool';
+  label: string;
+  status: 'pending' | 'completed' | 'failed';
+  input?: Record<string, unknown> | null;
+  output?: Record<string, unknown> | null;
+};
+
+export type AgentPlan = {
+  id: string;
+  type: AgentPlanType;
+  steps: AgentPlanStep[];
+  summary?: string;
+};

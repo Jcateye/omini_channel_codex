@@ -95,6 +95,28 @@ enum PromptOutcome {
   unknown
 }
 
+enum AgentMemoryScope {
+  session
+  lead
+}
+
+enum AgentRunType {
+  lead_scoring
+  campaign_optimization
+}
+
+enum AgentRunStatus {
+  pending
+  completed
+  failed
+}
+
+enum CampaignOptimizationStatus {
+  pending
+  applied
+  dismissed
+}
+
 model Organization {
   id        String   @id @default(uuid())
   name      String
@@ -121,6 +143,13 @@ model Organization {
   promptTemplates    PromptTemplate[]
   promptUsages       PromptUsage[]
   toolExecutionLogs  ToolExecutionLog[]
+  revenueEvents      RevenueEvent[]
+  agentMemories      AgentMemory[]
+  knowledgeSources   KnowledgeSource[]
+  knowledgeChunks    KnowledgeChunk[]
+  agentRuns          AgentRun[]
+  campaignOptimizations CampaignOptimization[]
+  leadAssignmentLogs LeadAssignmentLog[]
 }
 
 model ApiKey {
@@ -266,6 +295,7 @@ model Lead {
   metadata       Json?
   lastActivityAt DateTime?
   convertedAt    DateTime?
+  crmExternalId  String?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
@@ -274,9 +304,14 @@ model Lead {
   conversation Conversation? @relation(fields: [conversationId], references: [id])
   campaignSends CampaignSend[]
   attributions LeadAttribution[]
+  revenueEvents RevenueEvent[]
+  agentMemories AgentMemory[]
+  agentRuns     AgentRun[]
+  assignmentLogs LeadAssignmentLog[]
 
   @@index([organizationId])
   @@index([contactId])
+  @@index([crmExternalId])
 }
 
 model Campaign {
@@ -285,6 +320,7 @@ model Campaign {
   channelId      String
   name           String
   messageText    String
+  metadata       Json?
   status         CampaignStatus @default(draft)
   scheduledAt    DateTime?
   startedAt      DateTime?
@@ -305,6 +341,9 @@ model Campaign {
   sends        CampaignSend[]
   attributions LeadAttribution[]
   analyticsDaily AnalyticsDaily[]
+  revenueEvents RevenueEvent[]
+  agentRuns     AgentRun[]
+  optimizations CampaignOptimization[]
 
   @@index([organizationId])
   @@index([channelId])
@@ -516,4 +555,161 @@ model AnalyticsDaily {
   @@unique([organizationId, date, channelId, campaignId])
   @@index([organizationId])
   @@index([date])
+}
+
+model RevenueEvent {
+  id             String   @id @default(uuid())
+  organizationId String
+  leadId         String?
+  campaignId     String?
+  amount         Float
+  currency       String
+  source         String
+  externalId     String?
+  occurredAt     DateTime
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead?        @relation(fields: [leadId], references: [id])
+  campaign     Campaign?    @relation(fields: [campaignId], references: [id])
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([campaignId])
+  @@index([occurredAt])
+  @@unique([organizationId, source, externalId])
+}
+
+model AgentMemory {
+  id             String          @id @default(uuid())
+  organizationId String
+  scope          AgentMemoryScope
+  sessionId      String?
+  leadId         String?
+  key            String?
+  content        Json
+  metadata       Json?
+  expiresAt      DateTime
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead?        @relation(fields: [leadId], references: [id])
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([expiresAt])
+}
+
+model KnowledgeSource {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  description    String?
+  kind           String
+  config         Json?
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  chunks       KnowledgeChunk[]
+
+  @@index([organizationId])
+}
+
+model KnowledgeChunk {
+  id             String   @id @default(uuid())
+  organizationId String
+  sourceId       String
+  content        String
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization   @relation(fields: [organizationId], references: [id])
+  source       KnowledgeSource @relation(fields: [sourceId], references: [id])
+
+  @@index([organizationId])
+  @@index([sourceId])
+}
+
+model AgentRun {
+  id             String        @id @default(uuid())
+  organizationId String
+  type           AgentRunType
+  status         AgentRunStatus @default(pending)
+  leadId         String?
+  campaignId     String?
+  input          Json?
+  output         Json?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead?        @relation(fields: [leadId], references: [id])
+  campaign     Campaign?    @relation(fields: [campaignId], references: [id])
+  steps        AgentRunStep[]
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([campaignId])
+}
+
+model AgentRunStep {
+  id         String   @id @default(uuid())
+  runId      String
+  stepIndex  Int
+  stepType   String
+  status     String
+  input      Json?
+  output     Json?
+  startedAt  DateTime @default(now())
+  finishedAt DateTime?
+
+  run AgentRun @relation(fields: [runId], references: [id])
+
+  @@index([runId])
+}
+
+model CampaignOptimization {
+  id             String                     @id @default(uuid())
+  organizationId String
+  campaignId     String
+  type           String
+  title          String
+  description    String
+  status         CampaignOptimizationStatus @default(pending)
+  metrics        Json?
+  action         Json?
+  appliedAt      DateTime?
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  campaign     Campaign     @relation(fields: [campaignId], references: [id])
+
+  @@index([organizationId])
+  @@index([campaignId])
+  @@index([status])
+}
+
+model LeadAssignmentLog {
+  id             String   @id @default(uuid())
+  organizationId String
+  leadId         String
+  strategy       String
+  targetId       String
+  targetType     String
+  targetName     String?
+  rationale      Json?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead         @relation(fields: [leadId], references: [id])
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([strategy])
 }

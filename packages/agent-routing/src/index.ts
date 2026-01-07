@@ -1,6 +1,9 @@
 export type {
   AgentAdapter,
   AgentContext,
+  AgentPlan,
+  AgentPlanStep,
+  AgentPlanType,
   AgentResponse,
   AgentRoutingConfig,
   AgentRoutingRule,

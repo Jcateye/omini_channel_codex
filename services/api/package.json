@@ -20,7 +20,8 @@
     "@omini/database": "workspace:*",
     "@omini/queue": "workspace:*",
     "@omini/whatsapp-bsp": "workspace:*",
-    "hono": "^4.5.2"
+    "hono": "^4.5.2",
+    "langfuse": "^3.38.6"
   },
   "devDependencies": {
     "tsx": "^4.19.2",

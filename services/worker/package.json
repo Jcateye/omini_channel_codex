@@ -17,7 +17,8 @@
     "@omini/core": "workspace:*",
     "@omini/database": "workspace:*",
     "@omini/queue": "workspace:*",
-    "@omini/whatsapp-bsp": "workspace:*"
+    "@omini/whatsapp-bsp": "workspace:*",
+    "langfuse": "^3.38.6"
   },
   "devDependencies": {
     "tsx": "^4.19.2",

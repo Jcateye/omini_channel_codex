@@ -87,6 +87,13 @@ export default function ToolsPage() {
   const [logs, setLogs] = useState<ToolExecutionLog[]>([]);
   const [logsError, setLogsError] = useState('');
 
+  const [langfuseEnabled, setLangfuseEnabled] = useState(false);
+  const [langfuseBaseUrl, setLangfuseBaseUrl] = useState('https://cloud.langfuse.com');
+  const [langfusePublicKey, setLangfusePublicKey] = useState('');
+  const [langfuseSecretKey, setLangfuseSecretKey] = useState('');
+  const [langfuseStatus, setLangfuseStatus] = useState('');
+  const [langfuseError, setLangfuseError] = useState('');
+
   useEffect(() => {
     const savedKey = window.localStorage.getItem(storageKeys.apiKey) ?? '';
     const savedBase = window.localStorage.getItem(storageKeys.apiBase) ?? '';
@@ -269,6 +276,44 @@ export default function ToolsPage() {
       setLogs(data.logs ?? []);
     } catch (err) {
       setLogsError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const loadLangfuse = async () => {
+    setLangfuseError('');
+    setLangfuseStatus('');
+    try {
+      const data = await apiFetch<{
+        langfuse: { enabled: boolean; baseUrl: string; publicKey: string; secretKey: string };
+      }>('/v1/langfuse');
+      setLangfuseEnabled(data.langfuse.enabled);
+      setLangfuseBaseUrl(data.langfuse.baseUrl);
+      setLangfusePublicKey(data.langfuse.publicKey);
+      setLangfuseSecretKey('');
+      setLangfuseStatus('Langfuse settings loaded.');
+    } catch (err) {
+      setLangfuseError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const saveLangfuse = async () => {
+    setLangfuseError('');
+    setLangfuseStatus('');
+    try {
+      await apiFetch('/v1/langfuse', {
+        method: 'PUT',
+        body: JSON.stringify({
+          langfuse: {
+            enabled: langfuseEnabled,
+            baseUrl: langfuseBaseUrl,
+            publicKey: langfusePublicKey,
+            secretKey: langfuseSecretKey,
+          },
+        }),
+      });
+      setLangfuseStatus('Langfuse settings saved.');
+    } catch (err) {
+      setLangfuseError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -553,6 +598,48 @@ export default function ToolsPage() {
                 ))}
               </div>
             )}
+          </div>
+        </Card>
+
+        <Card>
+          <div className="flex flex-col gap-4">
+            <div className="space-y-1">
+              <CardTitle>Langfuse</CardTitle>
+              <CardDescription>Cloud prompt monitoring settings.</CardDescription>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Input
+                placeholder="Enabled (true/false)"
+                value={langfuseEnabled ? 'true' : 'false'}
+                onChange={(event) => setLangfuseEnabled(event.target.value !== 'false')}
+              />
+              <Input
+                placeholder="Base URL"
+                value={langfuseBaseUrl}
+                onChange={(event) => setLangfuseBaseUrl(event.target.value)}
+              />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Input
+                placeholder="Public key"
+                value={langfusePublicKey}
+                onChange={(event) => setLangfusePublicKey(event.target.value)}
+              />
+              <Input
+                placeholder="Secret key (leave blank to keep)"
+                type="password"
+                value={langfuseSecretKey}
+                onChange={(event) => setLangfuseSecretKey(event.target.value)}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button variant="outline" onClick={loadLangfuse}>
+                Load Langfuse
+              </Button>
+              <Button onClick={saveLangfuse}>Save Langfuse</Button>
+              {langfuseStatus ? <span className="text-xs text-accent">{langfuseStatus}</span> : null}
+              {langfuseError ? <span className="text-xs text-accent2">{langfuseError}</span> : null}
+            </div>
           </div>
         </Card>
       </div>

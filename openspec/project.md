@@ -1,31 +1,48 @@
 # Project Context
 
 ## Purpose
-[Describe your project's purpose and goals]
+Build an AI agent native omnichannel messaging and marketing platform (WA first) that
+supports agent driven auto-reply, lead capture, CRM sync, campaign orchestration, and ROI
+attribution across multiple channels.
 
 ## Tech Stack
-- [List your primary technologies]
-- [e.g., TypeScript, React, Node.js]
+- Runtime: Node.js 20+ / TypeScript 5.x
+- API: Hono
+- DB: PostgreSQL 16 + Prisma
+- Cache/Queue: Redis 7 + BullMQ
+- UI: Next.js 14 + Tailwind
+- Monorepo: pnpm + Turborepo
+- LLM/Agent: Claude + OpenAI (adapter based)
+- Telemetry: Langfuse (cloud)
 
 ## Project Conventions
 
 ### Code Style
-[Describe your code style preferences, formatting rules, and naming conventions]
+- Keep files focused and small; prefer explicit names and simple flows.
+- Use ASCII by default; add comments only for non-obvious logic.
 
 ### Architecture Patterns
-[Document your architectural decisions and patterns]
+- Adapter pattern for BSP/LLM/tool integrations.
+- Rule based routing for lead scoring and agent handoff.
+- Event oriented flow with async tasks via worker + queue.
 
 ### Testing Strategy
-[Explain your testing approach and requirements]
+- No formal test suite yet; use mock flows and manual verification.
 
 ### Git Workflow
-[Describe your branching strategy and commit conventions]
+- No enforced workflow yet; prefer small, scoped commits.
 
 ## Domain Context
-[Add domain-specific knowledge that AI assistants need to understand]
+- WA (WhatsApp) is primary channel; others are planned via adapters.
+- CRM sync is webhook based with metadata mapping and attribution.
+- Campaigns support scheduling, segmentation, and ROI tracking.
 
 ## Important Constraints
-[List any technical, business, or regulatory constraints]
+- Architecture must support multi-channel expansion.
+- Use message/lead attribution to connect revenue to campaigns.
+- Mock first; live integrations added after validation.
 
 ## External Dependencies
-[Document key external services, APIs, or systems]
+- WhatsApp BSPs (MessageBird live + mock).
+- Langfuse cloud telemetry.
+- PostgreSQL and Redis (via Docker locally).

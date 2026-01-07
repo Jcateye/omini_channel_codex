@@ -39,6 +39,94 @@ const resolveAnalyticsSettings = (settings: Record<string, unknown>) => {
   return { aggregationDays, attributionLookbackDays };
 };
 
+const resolveAgentIntelligenceSettings = (settings: Record<string, unknown>) => {
+  const agent = settings.agentIntelligence && typeof settings.agentIntelligence === 'object'
+    ? (settings.agentIntelligence as Record<string, unknown>)
+    : {};
+
+  const memoryRetentionDays =
+    typeof agent.memoryRetentionDays === 'number' && agent.memoryRetentionDays > 0
+      ? Math.floor(agent.memoryRetentionDays)
+      : 7;
+
+  const optimizationAutoApply = agent.optimizationAutoApply === true;
+
+  return { memoryRetentionDays, optimizationAutoApply };
+};
+
+const normalizeOptimizationStrategies = (input: unknown) => {
+  const defaults = {
+    enabled: true,
+    autoApplyActions: ['pause', 'schedule_shift', 'segment_tweak'],
+    rules: [
+      {
+        id: 'delivery_rate_low',
+        name: 'Delivery rate below 80%',
+        enabled: true,
+        thresholds: { deliveryRateMin: 0.8 },
+        action: { type: 'schedule_shift', safeAutoApply: true },
+      },
+      {
+        id: 'failure_rate_high',
+        name: 'Failure rate above 20%',
+        enabled: true,
+        thresholds: { failureRateMax: 0.2 },
+        action: { type: 'pause', safeAutoApply: true },
+      },
+      {
+        id: 'negative_roi',
+        name: 'ROI below 0',
+        enabled: true,
+        thresholds: { roiMin: 0 },
+        action: { type: 'segment_tweak', safeAutoApply: true },
+      },
+    ],
+  };
+
+  if (!input || typeof input !== 'object') {
+    return defaults;
+  }
+
+  const raw = input as Record<string, unknown>;
+  const enabled = raw.enabled !== false;
+  const autoApplyActions = Array.isArray(raw.autoApplyActions)
+    ? raw.autoApplyActions.filter((action) => typeof action === 'string')
+    : defaults.autoApplyActions;
+  const rules = Array.isArray(raw.rules)
+    ? raw.rules
+        .filter((rule) => rule && typeof rule === 'object')
+        .map((rule) => {
+          const item = rule as Record<string, unknown>;
+          const id = typeof item.id === 'string' ? item.id : 'rule';
+          const name = typeof item.name === 'string' ? item.name : id;
+          const enabled = item.enabled !== false;
+          const thresholds =
+            item.thresholds && typeof item.thresholds === 'object' && !Array.isArray(item.thresholds)
+              ? (item.thresholds as Record<string, unknown>)
+              : {};
+          const action =
+            item.action && typeof item.action === 'object' && !Array.isArray(item.action)
+              ? (item.action as Record<string, unknown>)
+              : {};
+          const actionType = typeof action.type === 'string' ? action.type : 'schedule_shift';
+          const safeAutoApply = action.safeAutoApply !== false;
+          return {
+            id,
+            name,
+            enabled,
+            thresholds,
+            action: { type: actionType, safeAutoApply },
+          };
+        })
+    : defaults.rules;
+
+  return {
+    enabled,
+    autoApplyActions,
+    rules,
+  };
+};
+
 const loadOrganizationSettings = async (organizationId: string) => {
   const organization = await prisma.organization.findUnique({
     where: { id: organizationId },
@@ -133,40 +221,60 @@ const upsertAnalyticsRow = async (input: {
   leadCreated: number;
   leadConverted: number;
   attributedConversions: number;
+  attributedRevenue?: number | null;
 }) => {
+  const channelId = input.channelId ?? null;
+  const campaignId = input.campaignId ?? null;
+
+  const data = {
+    organizationId: input.organizationId,
+    date: input.date,
+    channelId,
+    campaignId,
+    outboundSent: input.outboundSent,
+    outboundDelivered: input.outboundDelivered,
+    outboundFailed: input.outboundFailed,
+    inboundCount: input.inboundCount,
+    responseCount: input.responseCount,
+    leadCreated: input.leadCreated,
+    leadConverted: input.leadConverted,
+    attributedConversions: input.attributedConversions,
+    attributedRevenue: input.attributedRevenue ?? null,
+  };
+
+  if (channelId === null || campaignId === null) {
+    const existing = await prisma.analyticsDaily.findFirst({
+      where: {
+        organizationId: input.organizationId,
+        date: input.date,
+        channelId,
+        campaignId,
+      },
+    });
+
+    if (existing) {
+      await prisma.analyticsDaily.update({
+        where: { id: existing.id },
+        data,
+      });
+      return;
+    }
+
+    await prisma.analyticsDaily.create({ data });
+    return;
+  }
+
   await prisma.analyticsDaily.upsert({
     where: {
       organizationId_date_channelId_campaignId: {
         organizationId: input.organizationId,
         date: input.date,
-        channelId: input.channelId ?? null,
-        campaignId: input.campaignId ?? null,
+        channelId,
+        campaignId,
       },
     },
-    create: {
-      organizationId: input.organizationId,
-      date: input.date,
-      channelId: input.channelId ?? null,
-      campaignId: input.campaignId ?? null,
-      outboundSent: input.outboundSent,
-      outboundDelivered: input.outboundDelivered,
-      outboundFailed: input.outboundFailed,
-      inboundCount: input.inboundCount,
-      responseCount: input.responseCount,
-      leadCreated: input.leadCreated,
-      leadConverted: input.leadConverted,
-      attributedConversions: input.attributedConversions,
-    },
-    update: {
-      outboundSent: input.outboundSent,
-      outboundDelivered: input.outboundDelivered,
-      outboundFailed: input.outboundFailed,
-      inboundCount: input.inboundCount,
-      responseCount: input.responseCount,
-      leadCreated: input.leadCreated,
-      leadConverted: input.leadConverted,
-      attributedConversions: input.attributedConversions,
-    },
+    create: data,
+    update: data,
   });
 };
 
@@ -174,7 +282,7 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
   const dayStart = toDayStart(date);
   const dayEnd = addDays(dayStart, 1);
 
-  const [outboundSent, outboundDelivered, outboundFailed, inboundCount] = await Promise.all([
+  const [outboundSent, outboundDelivered, outboundFailed, inboundCount, revenueTotal] = await Promise.all([
     prisma.message.count({
       where: {
         organizationId,
@@ -204,6 +312,10 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
         direction: 'inbound',
         createdAt: { gte: dayStart, lt: dayEnd },
       },
+    }),
+    prisma.revenueEvent.aggregate({
+      where: { organizationId, occurredAt: { gte: dayStart, lt: dayEnd } },
+      _sum: { amount: true },
     }),
   ]);
 
@@ -288,6 +400,7 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
   });
 
   const attributedConversionsTotal = sumGroupCounts(attributionByCampaign);
+  const attributedRevenueTotal = revenueTotal._sum.amount ?? 0;
 
   await upsertAnalyticsRow({
     organizationId,
@@ -300,6 +413,7 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
     leadCreated,
     leadConverted,
     attributedConversions: attributedConversionsTotal,
+    attributedRevenue: attributedRevenueTotal,
   });
 
   const outboundMap = buildCountMap(outboundByChannel);
@@ -331,6 +445,7 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
       leadCreated: 0,
       leadConverted: 0,
       attributedConversions: attributionChannelMap.get(channelId) ?? 0,
+      attributedRevenue: null,
     });
   }
 
@@ -348,6 +463,14 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
   for (const campaignId of campaignIds) {
     const status = campaignStatusMap.get(campaignId) ?? { sent: 0, failed: 0 };
     const attributed = attributionByCampaign.find((row) => row.campaignId === campaignId);
+    const campaignRevenue = await prisma.revenueEvent.aggregate({
+      where: {
+        organizationId,
+        campaignId,
+        occurredAt: { gte: dayStart, lt: dayEnd },
+      },
+      _sum: { amount: true },
+    });
 
     await upsertAnalyticsRow({
       organizationId,
@@ -361,7 +484,202 @@ const computeDailyMetrics = async (organizationId: string, date: Date) => {
       leadCreated: 0,
       leadConverted: 0,
       attributedConversions: attributed?._count._all ?? 0,
+      attributedRevenue: campaignRevenue._sum.amount ?? 0,
     });
+  }
+};
+
+const recordOptimizationApply = async (input: {
+  campaignId: string;
+  optimizationId: string;
+  type: string;
+}) => {
+  const campaign = await prisma.campaign.findUnique({
+    where: { id: input.campaignId },
+  });
+
+  if (!campaign) {
+    return;
+  }
+
+  const metadata =
+    campaign.metadata && typeof campaign.metadata === 'object' && !Array.isArray(campaign.metadata)
+      ? { ...(campaign.metadata as Record<string, unknown>) }
+      : {};
+  const applied = Array.isArray(metadata.optimizationsApplied)
+    ? [...metadata.optimizationsApplied]
+    : [];
+
+  applied.push({
+    id: input.optimizationId,
+    type: input.type,
+    appliedAt: new Date().toISOString(),
+  });
+
+  metadata.optimizationsApplied = applied;
+
+  await prisma.campaign.update({
+    where: { id: input.campaignId },
+    data: { metadata },
+  });
+};
+
+const evaluateOptimizationStrategies = (input: {
+  strategies: ReturnType<typeof normalizeOptimizationStrategies>;
+  analytics: Array<{
+    campaignId: string | null;
+    outboundSent: number;
+    outboundDelivered: number;
+    outboundFailed: number;
+    attributedRevenue?: number | null;
+  }>;
+  campaigns: Array<{ id: string; cost?: number | null; revenue?: number | null }>;
+}) => {
+  if (!input.strategies.enabled) {
+    return [];
+  }
+
+  const campaignMap = new Map(input.campaigns.map((campaign) => [campaign.id, campaign]));
+  const recs: Array<{
+    campaignId: string;
+    type: string;
+    title: string;
+    description: string;
+    metrics: Record<string, unknown>;
+    action: Record<string, unknown>;
+  }> = [];
+
+  for (const row of input.analytics) {
+    if (!row.campaignId) continue;
+    const campaign = campaignMap.get(row.campaignId);
+    if (!campaign) continue;
+    const outboundSent = row.outboundSent ?? 0;
+    const outboundDelivered = row.outboundDelivered ?? 0;
+    const outboundFailed = row.outboundFailed ?? 0;
+    const deliveryRate = outboundSent > 0 ? outboundDelivered / outboundSent : 1;
+    const failureRate = outboundSent > 0 ? outboundFailed / outboundSent : 0;
+    const cost = campaign.cost ?? 0;
+    const attributedRevenue = row.attributedRevenue ?? 0;
+    const roi =
+      cost > 0 ? Number(((attributedRevenue - cost) / cost).toFixed(4)) : null;
+
+    for (const rule of input.strategies.rules) {
+      if (!rule.enabled) continue;
+      const thresholds = rule.thresholds ?? {};
+      const deliveryRateMin =
+        typeof thresholds.deliveryRateMin === 'number' ? thresholds.deliveryRateMin : null;
+      const failureRateMax =
+        typeof thresholds.failureRateMax === 'number' ? thresholds.failureRateMax : null;
+      const roiMin = typeof thresholds.roiMin === 'number' ? thresholds.roiMin : null;
+
+      if (deliveryRateMin !== null && deliveryRate >= deliveryRateMin) {
+        continue;
+      }
+      if (failureRateMax !== null && failureRate <= failureRateMax) {
+        continue;
+      }
+      if (roiMin !== null) {
+        if (roi === null) {
+          continue;
+        }
+        if (roi >= roiMin) {
+          continue;
+        }
+      }
+
+      recs.push({
+        campaignId: row.campaignId,
+        type: rule.id,
+        title: rule.name,
+        description: `Strategy triggered: ${rule.name}`,
+        metrics: {
+          deliveryRate,
+          failureRate,
+          roi,
+          outboundSent,
+        },
+        action: {
+          type: rule.action.type,
+          safeAutoApply: rule.action.safeAutoApply,
+        },
+      });
+    }
+  }
+
+  return recs;
+};
+
+const generateCampaignOptimizations = async (input: {
+  organizationId: string;
+  dayStart: Date;
+  autoApply: boolean;
+  strategies: ReturnType<typeof normalizeOptimizationStrategies>;
+}) => {
+  const rows = await prisma.analyticsDaily.findMany({
+    where: {
+      organizationId: input.organizationId,
+      date: input.dayStart,
+      campaignId: { not: null },
+    },
+  });
+
+  if (rows.length === 0) {
+    return;
+  }
+
+  const campaignIds = Array.from(
+    new Set(rows.map((row) => row.campaignId).filter((value): value is string => !!value))
+  );
+  const campaigns = await prisma.campaign.findMany({
+    where: { id: { in: campaignIds }, organizationId: input.organizationId },
+    select: { id: true, name: true, cost: true, revenue: true },
+  });
+  const recommendations = evaluateOptimizationStrategies({
+    strategies: input.strategies,
+    analytics: rows,
+    campaigns,
+  });
+
+  for (const rec of recommendations) {
+    const existing = await prisma.campaignOptimization.findFirst({
+      where: {
+        organizationId: input.organizationId,
+        campaignId: rec.campaignId,
+        type: rec.type,
+        status: { in: ['pending', 'applied'] },
+      },
+    });
+
+    if (existing) {
+      continue;
+    }
+
+    const canAutoApply =
+      input.autoApply &&
+      rec.action.safeAutoApply === true &&
+      input.strategies.autoApplyActions.includes(rec.action.type);
+
+    const optimization = await prisma.campaignOptimization.create({
+      data: {
+        organizationId: input.organizationId,
+        campaignId: rec.campaignId,
+        type: rec.type,
+        title: rec.title,
+        description: rec.description,
+        metrics: rec.metrics,
+        action: rec.action,
+        status: canAutoApply ? 'applied' : 'pending',
+        appliedAt: canAutoApply ? new Date() : null,
+      },
+    });
+
+    if (canAutoApply) {
+      await recordOptimizationApply({
+        campaignId: rec.campaignId,
+        optimizationId: optimization.id,
+        type: rec.type,
+      });
+    }
   }
 };
 
@@ -372,6 +690,10 @@ const runAnalyticsAggregation = async () => {
   for (const organization of organizations) {
     const settings = await loadOrganizationSettings(organization.id);
     const { aggregationDays, attributionLookbackDays } = resolveAnalyticsSettings(settings);
+    const { optimizationAutoApply } = resolveAgentIntelligenceSettings(settings);
+    const optimizationStrategies = normalizeOptimizationStrategies(
+      (settings.agentStrategies as Record<string, unknown> | undefined)?.optimization
+    );
 
     const start = addDays(today, -(aggregationDays - 1));
 
@@ -392,6 +714,15 @@ const runAnalyticsAggregation = async () => {
       }
 
       await computeDailyMetrics(organization.id, dayStart);
+
+      if (dayStart.getTime() === today.getTime()) {
+        await generateCampaignOptimizations({
+          organizationId: organization.id,
+          dayStart,
+          autoApply: optimizationAutoApply,
+          strategies: optimizationStrategies,
+        });
+      }
     }
   }
 };

@@ -8,8 +8,14 @@ import { applyLeadRules, type LeadRule } from '@omini/core';
 import type { AgentRoutingConfig, AgentRoutingRule } from '@omini/agent-routing';
 import { listAgentAdapters, selectAgent } from '@omini/agent-routing';
 import type { ToolExecutionRequest } from '@omini/agent-tools';
-import { executeTool, getExternalAdapter, listExternalAdapters, registerExternalAdapter } from '@omini/agent-tools';
+import {
+  executeTool,
+  getExternalAdapter,
+  listExternalAdapters,
+  registerExternalAdapter,
+} from '@omini/agent-tools';
 import { mockExternalAdapter } from '@omini/agent-tools';
+import { Langfuse } from 'langfuse';
 import { prisma } from '@omini/database';
 import { createQueue, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter } from '@omini/whatsapp-bsp';
@@ -208,6 +214,521 @@ const normalizeAnalyticsSettings = (input: unknown) => {
   };
 };
 
+const normalizeAgentIntelligenceSettings = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return {
+      memoryRetentionDays: 7,
+      optimizationAutoApply: false,
+    };
+  }
+
+  const settings = input as Record<string, unknown>;
+  const memoryRetentionDays =
+    typeof settings.memoryRetentionDays === 'number' && settings.memoryRetentionDays > 0
+      ? Math.floor(settings.memoryRetentionDays)
+      : 7;
+  const optimizationAutoApply = settings.optimizationAutoApply === true;
+
+  return {
+    memoryRetentionDays,
+    optimizationAutoApply,
+  };
+};
+
+const normalizeOptimizationStrategies = (input: unknown) => {
+  const defaults = {
+    enabled: true,
+    autoApplyActions: ['pause', 'schedule_shift', 'segment_tweak'],
+    rules: [
+      {
+        id: 'delivery_rate_low',
+        name: 'Delivery rate below 80%',
+        enabled: true,
+        thresholds: { deliveryRateMin: 0.8 },
+        action: { type: 'schedule_shift', safeAutoApply: true },
+      },
+      {
+        id: 'failure_rate_high',
+        name: 'Failure rate above 20%',
+        enabled: true,
+        thresholds: { failureRateMax: 0.2 },
+        action: { type: 'pause', safeAutoApply: true },
+      },
+      {
+        id: 'negative_roi',
+        name: 'ROI below 0',
+        enabled: true,
+        thresholds: { roiMin: 0 },
+        action: { type: 'segment_tweak', safeAutoApply: true },
+      },
+    ],
+  };
+
+  if (!input || typeof input !== 'object') {
+    return defaults;
+  }
+
+  const raw = input as Record<string, unknown>;
+  const enabled = raw.enabled !== false;
+  const autoApplyActions = Array.isArray(raw.autoApplyActions)
+    ? raw.autoApplyActions.filter((action) => typeof action === 'string')
+    : defaults.autoApplyActions;
+  const rules = Array.isArray(raw.rules)
+    ? raw.rules
+        .filter((rule) => rule && typeof rule === 'object')
+        .map((rule) => {
+          const item = rule as Record<string, unknown>;
+          const id = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `rule_${createTrackingToken()}`;
+          const name = typeof item.name === 'string' ? item.name.trim() : id;
+          const enabled = item.enabled !== false;
+          const thresholds =
+            item.thresholds && typeof item.thresholds === 'object' && !Array.isArray(item.thresholds)
+              ? (item.thresholds as Record<string, unknown>)
+              : {};
+          const action =
+            item.action && typeof item.action === 'object' && !Array.isArray(item.action)
+              ? (item.action as Record<string, unknown>)
+              : {};
+          const actionType = typeof action.type === 'string' ? action.type : 'schedule_shift';
+          const safeAutoApply = action.safeAutoApply !== false;
+          return {
+            id,
+            name,
+            enabled,
+            thresholds,
+            action: {
+              type: actionType,
+              safeAutoApply,
+            },
+          };
+        })
+    : defaults.rules;
+
+  return {
+    enabled,
+    autoApplyActions,
+    rules,
+  };
+};
+
+const normalizeDistributionStrategies = (input: unknown) => {
+  const defaults = {
+    mode: 'round_robin',
+    targets: [
+      { id: 'sales', name: 'Sales', weight: 1, skills: ['sales'] },
+      { id: 'support', name: 'Support', weight: 1, skills: ['support'] },
+    ],
+    state: { cursor: 0 },
+  };
+
+  if (!input || typeof input !== 'object') {
+    return defaults;
+  }
+
+  const raw = input as Record<string, unknown>;
+  const mode =
+    typeof raw.mode === 'string' && ['round_robin', 'weighted', 'skill_based'].includes(raw.mode)
+      ? raw.mode
+      : defaults.mode;
+
+  const targets = Array.isArray(raw.targets)
+    ? raw.targets
+        .filter((target) => target && typeof target === 'object')
+        .map((target) => {
+          const item = target as Record<string, unknown>;
+          const id = typeof item.id === 'string' ? item.id.trim() : '';
+          const name = typeof item.name === 'string' ? item.name.trim() : id;
+          const weight = typeof item.weight === 'number' && item.weight > 0 ? item.weight : 1;
+          const skills = Array.isArray(item.skills)
+            ? item.skills.filter((skill) => typeof skill === 'string')
+            : [];
+          const stages = Array.isArray(item.stages)
+            ? item.stages.filter((stage) => typeof stage === 'string')
+            : [];
+          return { id, name, weight, skills, stages };
+        })
+        .filter((target) => target.id.length > 0)
+    : defaults.targets;
+
+  const state =
+    raw.state && typeof raw.state === 'object' && !Array.isArray(raw.state)
+      ? (raw.state as Record<string, unknown>)
+      : {};
+  const cursor = typeof state.cursor === 'number' && state.cursor >= 0 ? Math.floor(state.cursor) : 0;
+
+  return {
+    mode,
+    targets,
+    state: { cursor },
+  };
+};
+
+const selectDistributionTarget = (input: {
+  distribution: ReturnType<typeof normalizeDistributionStrategies>;
+  lead: {
+    stage: string;
+    tags: string[];
+    metadata?: Record<string, unknown> | null;
+  };
+  suggestedQueue?: string | null;
+}) => {
+  const { distribution } = input;
+  const targets = distribution.targets;
+  if (!targets.length) {
+    return { target: null, rationale: ['no_targets'] };
+  }
+
+  const leadTags = input.lead.tags.map((tag) => tag.toLowerCase());
+  const leadStage = input.lead.stage.toLowerCase();
+
+  if (distribution.mode === 'skill_based') {
+    const matched = targets.find((target) => {
+      const skills = (target.skills ?? []).map((skill) => skill.toLowerCase());
+      const stages = (target.stages ?? []).map((stage) => stage.toLowerCase());
+      const stageMatch = stages.length === 0 || stages.includes(leadStage);
+      const skillMatch =
+        skills.length === 0 || skills.some((skill) => leadTags.includes(skill));
+      return stageMatch && skillMatch;
+    });
+
+    if (matched) {
+    return { target: matched, rationale: ['skill_match'] };
+  }
+  }
+
+  if (distribution.mode === 'weighted') {
+    const total = targets.reduce((sum, target) => sum + (target.weight ?? 1), 0);
+    if (total > 0) {
+      let pick = Math.random() * total;
+      for (const target of targets) {
+        pick -= target.weight ?? 1;
+        if (pick <= 0) {
+          return { target, rationale: ['weighted_pick'] };
+        }
+      }
+    }
+  }
+
+  if (distribution.mode === 'round_robin') {
+    const cursor = distribution.state.cursor ?? 0;
+    const index = cursor % targets.length;
+    const target = targets[index];
+    return {
+      target,
+      rationale: ['round_robin', `cursor:${cursor}`],
+      nextCursor: cursor + 1,
+    };
+  }
+
+  if (input.suggestedQueue) {
+    const matched = targets.find((target) => target.id === input.suggestedQueue);
+    if (matched) {
+      return { target: matched, rationale: ['suggested_queue'] };
+    }
+  }
+
+  return { target: targets[0], rationale: ['fallback'] };
+};
+
+const normalizeLangfuseSettings = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return {
+      enabled: false,
+      baseUrl: 'https://cloud.langfuse.com',
+      publicKey: '',
+      secretKey: '',
+    };
+  }
+
+  const settings = input as Record<string, unknown>;
+  const enabled = typeof settings.enabled === 'boolean' ? settings.enabled : false;
+  const baseUrl =
+    typeof settings.baseUrl === 'string' && settings.baseUrl.trim().length > 0
+      ? settings.baseUrl.trim()
+      : 'https://cloud.langfuse.com';
+  const publicKey = typeof settings.publicKey === 'string' ? settings.publicKey.trim() : '';
+  const secretKey = typeof settings.secretKey === 'string' ? settings.secretKey.trim() : '';
+
+  return {
+    enabled,
+    baseUrl: baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl,
+    publicKey,
+    secretKey,
+  };
+};
+
+const langfuseClients = new Map<string, Langfuse>();
+
+const getLangfuseClient = (settings: ReturnType<typeof normalizeLangfuseSettings>) => {
+  if (!settings.enabled || !settings.publicKey || !settings.secretKey) {
+    return null;
+  }
+
+  const key = `${settings.baseUrl}|${settings.publicKey}|${settings.secretKey}`;
+  const existing = langfuseClients.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const client = new Langfuse({
+    publicKey: settings.publicKey,
+    secretKey: settings.secretKey,
+    baseUrl: settings.baseUrl,
+  });
+  langfuseClients.set(key, client);
+  return client;
+};
+
+const sendLangfuseTrace = async (
+  settings: ReturnType<typeof normalizeLangfuseSettings>,
+  payload: Record<string, unknown>
+) => {
+  const client = getLangfuseClient(settings);
+  if (!client) {
+    return;
+  }
+
+  try {
+    client.trace(payload as Parameters<Langfuse['trace']>[0]);
+    await client.flushAsync();
+  } catch (error) {
+    console.warn('Langfuse trace failed', error);
+  }
+};
+
+const buildExpiresAt = (days: number) => {
+  const expires = new Date();
+  expires.setUTCDate(expires.getUTCDate() + days);
+  return expires;
+};
+
+const normalizeQueryTokens = (value: string) =>
+  value
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1);
+
+const splitContentIntoChunks = (content: string, maxLength = 600) => {
+  const blocks = content
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter((block) => block.length > 0);
+
+  const chunks: string[] = [];
+  for (const block of blocks) {
+    if (block.length <= maxLength) {
+      chunks.push(block);
+      continue;
+    }
+
+    let cursor = 0;
+    while (cursor < block.length) {
+      chunks.push(block.slice(cursor, cursor + maxLength));
+      cursor += maxLength;
+    }
+  }
+
+  return chunks;
+};
+
+const listActiveMemories = async (input: {
+  organizationId: string;
+  leadId?: string | null;
+  sessionId?: string | null;
+  limit?: number;
+}) => {
+  const { organizationId, leadId, sessionId } = input;
+  const limit = input.limit ?? 20;
+  const now = new Date();
+
+  const or: Prisma.AgentMemoryWhereInput[] = [];
+  if (leadId) {
+    or.push({ scope: 'lead', leadId });
+  }
+  if (sessionId) {
+    or.push({ scope: 'session', sessionId });
+  }
+
+  if (or.length === 0) {
+    return [];
+  }
+
+  return prisma.agentMemory.findMany({
+    where: {
+      organizationId,
+      expiresAt: { gt: now },
+      OR: or,
+    },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+  });
+};
+
+const createAgentMemory = async (input: {
+  organizationId: string;
+  scope: 'session' | 'lead';
+  leadId?: string | null;
+  sessionId?: string | null;
+  key?: string | null;
+  content: Record<string, unknown>;
+  metadata?: Record<string, unknown> | null;
+  retentionDays: number;
+}) => {
+  return prisma.agentMemory.create({
+    data: {
+      organizationId: input.organizationId,
+      scope: input.scope,
+      leadId: input.leadId ?? null,
+      sessionId: input.sessionId ?? null,
+      key: input.key ?? null,
+      content: input.content,
+      metadata: input.metadata ?? null,
+      expiresAt: buildExpiresAt(input.retentionDays),
+    },
+  });
+};
+
+const retrieveKnowledgeChunks = async (input: {
+  organizationId: string;
+  query: string;
+  sourceIds?: string[];
+  topK?: number;
+}) => {
+  const query = input.query.trim();
+  if (!query) {
+    return [];
+  }
+
+  const tokens = normalizeQueryTokens(query);
+  const where: Prisma.KnowledgeChunkWhereInput = {
+    organizationId: input.organizationId,
+    source: { enabled: true },
+  };
+
+  if (input.sourceIds && input.sourceIds.length > 0) {
+    where.sourceId = { in: input.sourceIds };
+  }
+
+  if (tokens.length > 0) {
+    where.OR = tokens.map((token) => ({
+      content: { contains: token, mode: 'insensitive' },
+    }));
+  }
+
+  const chunks = await prisma.knowledgeChunk.findMany({
+    where,
+    take: 50,
+  });
+
+  const scored = chunks
+    .map((chunk) => {
+      const text = chunk.content.toLowerCase();
+      const score = tokens.reduce((total, token) => {
+        if (!text.includes(token)) return total;
+        return total + (text.split(token).length - 1);
+      }, 0);
+      return { chunk, score };
+    })
+    .filter((row) => row.score > 0 || tokens.length === 0);
+
+  scored.sort((a, b) => b.score - a.score);
+  const topK = input.topK ?? 5;
+
+  return scored.slice(0, topK).map((row) => ({
+    id: row.chunk.id,
+    sourceId: row.chunk.sourceId,
+    content: row.chunk.content,
+    score: row.score,
+    metadata: row.chunk.metadata,
+  }));
+};
+
+const evaluateOptimizationStrategies = (input: {
+  strategies: ReturnType<typeof normalizeOptimizationStrategies>;
+  analytics: Array<{
+    campaignId: string | null;
+    outboundSent: number;
+    outboundDelivered: number;
+    outboundFailed: number;
+    attributedRevenue?: number | null;
+  }>;
+  campaigns: Array<{ id: string; cost?: number | null; revenue?: number | null }>;
+}) => {
+  if (!input.strategies.enabled) {
+    return [];
+  }
+
+  const campaignMap = new Map(input.campaigns.map((campaign) => [campaign.id, campaign]));
+  const recs: Array<{
+    campaignId: string;
+    type: string;
+    title: string;
+    description: string;
+    metrics: Record<string, unknown>;
+    action: Record<string, unknown>;
+  }> = [];
+
+  for (const row of input.analytics) {
+    if (!row.campaignId) continue;
+    const campaign = campaignMap.get(row.campaignId);
+    if (!campaign) continue;
+    const outboundSent = row.outboundSent ?? 0;
+    const outboundDelivered = row.outboundDelivered ?? 0;
+    const outboundFailed = row.outboundFailed ?? 0;
+    const deliveryRate = outboundSent > 0 ? outboundDelivered / outboundSent : 1;
+    const failureRate = outboundSent > 0 ? outboundFailed / outboundSent : 0;
+    const cost = campaign.cost ?? 0;
+    const attributedRevenue = row.attributedRevenue ?? 0;
+    const roi =
+      cost > 0 ? Number(((attributedRevenue - cost) / cost).toFixed(4)) : null;
+
+    for (const rule of input.strategies.rules) {
+      if (!rule.enabled) continue;
+      const thresholds = rule.thresholds ?? {};
+      const deliveryRateMin =
+        typeof thresholds.deliveryRateMin === 'number' ? thresholds.deliveryRateMin : null;
+      const failureRateMax =
+        typeof thresholds.failureRateMax === 'number' ? thresholds.failureRateMax : null;
+      const roiMin = typeof thresholds.roiMin === 'number' ? thresholds.roiMin : null;
+
+      if (deliveryRateMin !== null && deliveryRate >= deliveryRateMin) {
+        continue;
+      }
+      if (failureRateMax !== null && failureRate <= failureRateMax) {
+        continue;
+      }
+      if (roiMin !== null) {
+        if (roi === null) {
+          continue;
+        }
+        if (roi >= roiMin) {
+          continue;
+        }
+      }
+
+      recs.push({
+        campaignId: row.campaignId,
+        type: rule.id,
+        title: rule.name,
+        description: `Strategy triggered: ${rule.name}`,
+        metrics: {
+          deliveryRate,
+          failureRate,
+          roi,
+          outboundSent,
+        },
+        action: {
+          type: rule.action.type,
+          safeAutoApply: rule.action.safeAutoApply,
+        },
+      });
+    }
+  }
+
+  return recs;
+};
+
 const normalizeToolSchema = (input: unknown) => {
   if (!input || typeof input !== 'object') {
     return { input: {}, output: {} };
@@ -286,6 +807,473 @@ const checkToolPermission = async (organizationId: string, toolId: string, agent
   const match = permissions.find((perm) => perm.agentId === agentId) ??
     permissions.find((perm) => perm.agentId === null);
   return match?.allowed ?? false;
+};
+
+const normalizeLeadStage = (stage?: unknown) =>
+  typeof stage === 'string' && leadStages.has(stage) ? stage : undefined;
+
+const normalizeCurrency = (currency?: unknown) => {
+  if (typeof currency !== 'string') {
+    return null;
+  }
+  const normalized = currency.trim().toUpperCase();
+  return normalized.length >= 3 ? normalized : null;
+};
+
+const applyLeadUpdate = async (
+  lead: { id: string; stage: string },
+  updates: Record<string, unknown>
+) => {
+  const normalized = { ...updates };
+  const stage = normalizeLeadStage(updates.stage);
+  if (stage) {
+    normalized.stage = stage;
+  }
+
+  const conversionUpdates = applyConversionUpdate(lead.stage, normalized);
+  return prisma.lead.update({
+    where: { id: lead.id },
+    data: {
+      ...conversionUpdates,
+      lastActivityAt: new Date(),
+    },
+  });
+};
+
+const computeLeadAgentDecision = (input: {
+  lead: {
+    stage: string;
+    score?: number | null;
+    tags: string[];
+    source?: string | null;
+    metadata?: Record<string, unknown> | null;
+  };
+  text?: string;
+  signals?: string[];
+  memories: Array<{ content: Record<string, unknown> }>;
+  knowledge: Array<{ content: string }>;
+}) => {
+  const tags = [...input.lead.tags];
+  const addTag = (tag: string) => {
+    if (!tags.includes(tag)) {
+      tags.push(tag);
+    }
+  };
+
+  const normalizedText = (input.text ?? '').toLowerCase();
+  const signals = (input.signals ?? []).map((signal) => signal.toLowerCase());
+  const hasSignal = (value: string) => signals.includes(value);
+
+  const knowledgeText = input.knowledge.map((chunk) => chunk.content.toLowerCase()).join(' ');
+  const memoryText = input.memories
+    .map((memory) => JSON.stringify(memory.content ?? {}).toLowerCase())
+    .join(' ');
+
+  let stage = input.lead.stage;
+  let score = typeof input.lead.score === 'number' ? input.lead.score : 0;
+  let assignmentQueue: string | null = null;
+  const rationale: string[] = [];
+
+  if (
+    hasSignal('purchase') ||
+    normalizedText.includes('ready to buy') ||
+    normalizedText.includes('buy')
+  ) {
+    stage = 'qualified';
+    score += 10;
+    addTag('high-intent');
+    assignmentQueue = 'sales';
+    rationale.push('purchase_intent');
+  }
+
+  if (hasSignal('demo') || normalizedText.includes('demo')) {
+    if (stage === 'new') {
+      stage = 'nurtured';
+    }
+    score += 5;
+    addTag('demo');
+    assignmentQueue = assignmentQueue ?? 'sales';
+    rationale.push('demo_request');
+  }
+
+  if (normalizedText.includes('price') || knowledgeText.includes('pricing')) {
+    score += 3;
+    addTag('pricing');
+    rationale.push('pricing_interest');
+  }
+
+  if (knowledgeText.includes('enterprise') || memoryText.includes('enterprise')) {
+    score += 2;
+    addTag('enterprise');
+    rationale.push('enterprise_signal');
+  }
+
+  if (memoryText.includes('complaint') || normalizedText.includes('complaint')) {
+    addTag('needs-attention');
+    assignmentQueue = assignmentQueue ?? 'support';
+    rationale.push('complaint_signal');
+  }
+
+  const updates: Record<string, unknown> = {};
+
+  if (tags.join('|') !== input.lead.tags.join('|')) {
+    updates.tags = tags;
+  }
+
+  if (stage !== input.lead.stage) {
+    updates.stage = stage;
+  }
+
+  if (score !== (input.lead.score ?? 0)) {
+    updates.score = score;
+  }
+
+  if (assignmentQueue) {
+    const existingMetadata =
+      input.lead.metadata && typeof input.lead.metadata === 'object' && !Array.isArray(input.lead.metadata)
+        ? { ...(input.lead.metadata as Record<string, unknown>) }
+        : {};
+    if (existingMetadata.assignmentQueue !== assignmentQueue) {
+      existingMetadata.assignmentQueue = assignmentQueue;
+      existingMetadata.assignmentReason = rationale;
+      updates.metadata = existingMetadata;
+    }
+  }
+
+  return {
+    updates,
+    rationale,
+    assignmentQueue,
+  };
+};
+
+const runLeadAgentWorkflow = async (input: {
+  organizationId: string;
+  leadId: string;
+  text?: string;
+  signals?: string[];
+  sessionId?: string | null;
+}) => {
+  const lead = await prisma.lead.findUnique({
+    where: { id: input.leadId },
+  });
+
+  if (!lead) {
+    return { lead: null, updates: {}, decision: null, runId: null };
+  }
+
+  const settings = await loadOrganizationSettings(input.organizationId);
+  const agentSettings = normalizeAgentIntelligenceSettings(settings.agentIntelligence);
+  const distributionSettings = normalizeDistributionStrategies(
+    (settings.agentStrategies as Record<string, unknown> | undefined)?.distribution
+  );
+
+  const run = await prisma.agentRun.create({
+    data: {
+      organizationId: input.organizationId,
+      type: 'lead_scoring',
+      leadId: lead.id,
+      input: {
+        text: input.text ?? null,
+        signals: input.signals ?? [],
+      },
+    },
+  });
+
+  const memories = await listActiveMemories({
+    organizationId: input.organizationId,
+    leadId: lead.id,
+    sessionId: input.sessionId ?? null,
+  });
+
+  await prisma.agentRunStep.create({
+    data: {
+      runId: run.id,
+      stepIndex: 0,
+      stepType: 'memory',
+      status: 'completed',
+      input: { leadId: lead.id, sessionId: input.sessionId ?? null },
+      output: { count: memories.length, memoryIds: memories.map((memory) => memory.id) },
+      finishedAt: new Date(),
+    },
+  });
+
+  const knowledge = await retrieveKnowledgeChunks({
+    organizationId: input.organizationId,
+    query: input.text ?? input.signals?.join(' ') ?? '',
+    topK: 5,
+  });
+
+  await prisma.agentRunStep.create({
+    data: {
+      runId: run.id,
+      stepIndex: 1,
+      stepType: 'retrieval',
+      status: 'completed',
+      input: { query: input.text ?? input.signals ?? [] },
+      output: { count: knowledge.length, chunkIds: knowledge.map((chunk) => chunk.id) },
+      finishedAt: new Date(),
+    },
+  });
+
+  const decision = computeLeadAgentDecision({
+    lead: {
+      stage: lead.stage,
+      score: lead.score,
+      tags: lead.tags,
+      source: lead.source,
+      metadata:
+        lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
+          ? (lead.metadata as Record<string, unknown>)
+          : null,
+    },
+    text: input.text,
+    signals: input.signals,
+    memories,
+    knowledge,
+  });
+
+  const derivedStage =
+    typeof decision.updates.stage === 'string' ? (decision.updates.stage as string) : lead.stage;
+  const derivedTags = Array.isArray(decision.updates.tags)
+    ? (decision.updates.tags as string[])
+    : lead.tags;
+
+  const distributionDecision = selectDistributionTarget({
+    distribution: distributionSettings,
+    lead: {
+      stage: derivedStage,
+      tags: derivedTags,
+      metadata:
+        lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
+          ? (lead.metadata as Record<string, unknown>)
+          : null,
+    },
+    suggestedQueue: decision.assignmentQueue,
+  });
+
+  if (distributionDecision.nextCursor !== undefined) {
+    const agentStrategies =
+      settings.agentStrategies && typeof settings.agentStrategies === 'object'
+        ? { ...(settings.agentStrategies as Record<string, unknown>) }
+        : {};
+    const currentDistribution = normalizeDistributionStrategies(agentStrategies.distribution);
+    const updatedDistribution = {
+      ...currentDistribution,
+      state: { cursor: distributionDecision.nextCursor },
+    };
+    await prisma.organization.update({
+      where: { id: input.organizationId },
+      data: {
+        settings: {
+          ...settings,
+          agentStrategies: {
+            ...agentStrategies,
+            distribution: updatedDistribution,
+          },
+        },
+      },
+    });
+  }
+
+  await prisma.agentRunStep.create({
+    data: {
+      runId: run.id,
+      stepIndex: 2,
+      stepType: 'tool',
+      status: 'completed',
+      input: {
+        toolId: 'internal.lead_scoring',
+        signals: input.signals ?? [],
+        text: input.text ?? null,
+      },
+      output: {
+        updates: decision.updates,
+        rationale: decision.rationale,
+      },
+      finishedAt: new Date(),
+    },
+  });
+
+  if (distributionDecision.target) {
+    await prisma.agentRunStep.create({
+      data: {
+        runId: run.id,
+        stepIndex: 3,
+        stepType: 'distribution',
+        status: 'completed',
+        input: {
+          assignmentQueue: distributionDecision.target.id,
+          strategy: distributionSettings.mode,
+          rationale: distributionDecision.rationale,
+        },
+        output: {
+          assigned: true,
+        },
+        finishedAt: new Date(),
+      },
+    });
+  }
+
+  let updatedLead = lead;
+  const mergedUpdates = { ...decision.updates };
+
+  if (distributionDecision.target) {
+    const existingMetadata =
+      lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
+        ? { ...(lead.metadata as Record<string, unknown>) }
+        : {};
+    existingMetadata.assignmentQueue = distributionDecision.target.id;
+    existingMetadata.assignmentStrategy = distributionSettings.mode;
+    existingMetadata.assignmentRationale = distributionDecision.rationale;
+    mergedUpdates.metadata = existingMetadata;
+  }
+
+  if (Object.keys(mergedUpdates).length > 0) {
+    updatedLead = await applyLeadUpdate(lead, mergedUpdates);
+  }
+
+  if (distributionDecision.target) {
+    await prisma.leadAssignmentLog.create({
+      data: {
+        organizationId: input.organizationId,
+        leadId: lead.id,
+        strategy: distributionSettings.mode,
+        targetId: distributionDecision.target.id,
+        targetType: 'queue',
+        targetName: distributionDecision.target.name ?? null,
+        rationale: { reasons: distributionDecision.rationale },
+        metadata: {
+          suggestedQueue: decision.assignmentQueue ?? null,
+        },
+      },
+    });
+  }
+
+  if (input.text || (input.signals && input.signals.length > 0)) {
+    await createAgentMemory({
+      organizationId: input.organizationId,
+      scope: 'lead',
+      leadId: lead.id,
+      sessionId: null,
+      key: 'lead_signal',
+      content: {
+        text: input.text ?? null,
+        signals: input.signals ?? [],
+      },
+      retentionDays: agentSettings.memoryRetentionDays,
+    });
+  }
+
+  if (input.sessionId && input.text) {
+    await createAgentMemory({
+      organizationId: input.organizationId,
+      scope: 'session',
+      leadId: null,
+      sessionId: input.sessionId,
+      key: 'session_message',
+      content: {
+        text: input.text,
+      },
+      retentionDays: agentSettings.memoryRetentionDays,
+    });
+  }
+
+  await prisma.agentRun.update({
+    where: { id: run.id },
+    data: {
+      status: 'completed',
+      output: {
+        updates: mergedUpdates,
+        rationale: decision.rationale,
+        assignmentQueue: distributionDecision.target?.id ?? null,
+      },
+    },
+  });
+
+  return {
+    lead: updatedLead,
+    updates: mergedUpdates,
+    decision: {
+      ...decision,
+      assignmentQueue: distributionDecision.target?.id ?? null,
+    },
+    runId: run.id,
+  };
+};
+
+const normalizeCrmFieldMapping = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return {};
+  }
+  const mapping = input as Record<string, unknown>;
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(mapping)) {
+    if (typeof key !== 'string' || typeof value !== 'string') continue;
+    const target = value.trim();
+    if (!target) continue;
+    normalized[key.trim()] = target;
+  }
+  return normalized;
+};
+
+const validateCrmFieldMapping = (mapping: Record<string, string>) => {
+  const errors: Array<{ key: string; message: string }> = [];
+  const keyPattern = /^[a-zA-Z0-9_.-]+$/;
+  const reservedTargets = new Set([
+    'id',
+    'organizationId',
+    'contactId',
+    'conversationId',
+    'stage',
+    'tags',
+    'source',
+    'score',
+    'crmExternalId',
+    'createdAt',
+    'updatedAt',
+  ]);
+
+  for (const [source, target] of Object.entries(mapping)) {
+    if (!source || source.length > 120) {
+      errors.push({ key: source, message: 'source_key_invalid' });
+      continue;
+    }
+    if (!target || target.length > 120) {
+      errors.push({ key: source, message: 'target_key_invalid' });
+      continue;
+    }
+    if (!keyPattern.test(source) || !keyPattern.test(target)) {
+      errors.push({ key: source, message: 'invalid_characters' });
+      continue;
+    }
+    if (reservedTargets.has(target) || target.startsWith('lead.')) {
+      errors.push({ key: source, message: 'reserved_target' });
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+};
+
+const applyCrmMetadataMapping = (
+  metadata: Record<string, unknown> | null,
+  payload: Record<string, unknown>,
+  mapping: Record<string, string>
+) => {
+  if (!mapping || Object.keys(mapping).length === 0) {
+    return metadata;
+  }
+
+  const next = metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? { ...metadata } : {};
+  for (const [sourceKey, targetKey] of Object.entries(mapping)) {
+    if (sourceKey in payload) {
+      next[targetKey] = payload[sourceKey];
+    }
+  }
+  return next;
 };
 
 const normalizeStringList = (input: unknown) => {
@@ -645,6 +1633,265 @@ api.post('/v1/agent-routing/test', async (c) => {
   });
 
   return c.json({ decision });
+});
+
+api.get('/v1/agent/settings', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const agentSettings = normalizeAgentIntelligenceSettings(settings.agentIntelligence);
+
+  return c.json({ settings: agentSettings });
+});
+
+api.put('/v1/agent/settings', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const agentSettings = normalizeAgentIntelligenceSettings(
+    (body.agentIntelligence as Record<string, unknown>) ?? body
+  );
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        agentIntelligence: agentSettings,
+      },
+    },
+  });
+
+  return c.json({ settings: agentSettings });
+});
+
+api.get('/v1/agent/strategies', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const optimization = normalizeOptimizationStrategies(
+    (settings.agentStrategies as Record<string, unknown> | undefined)?.optimization
+  );
+  const distribution = normalizeDistributionStrategies(
+    (settings.agentStrategies as Record<string, unknown> | undefined)?.distribution
+  );
+
+  return c.json({ strategies: { optimization, distribution } });
+});
+
+api.put('/v1/agent/strategies', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const payload = (body.strategies as Record<string, unknown>) ?? body;
+
+  const optimization = normalizeOptimizationStrategies(payload.optimization);
+  const distribution = normalizeDistributionStrategies(payload.distribution);
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        agentStrategies: {
+          optimization,
+          distribution,
+        },
+      },
+    },
+  });
+
+  return c.json({ strategies: { optimization, distribution } });
+});
+
+api.post('/v1/agent/distribution/preview', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const leadId = typeof body.leadId === 'string' ? body.leadId : null;
+  const stage = typeof body.stage === 'string' ? body.stage : 'new';
+  const tags = Array.isArray(body.tags)
+    ? body.tags.filter((tag) => typeof tag === 'string')
+    : [];
+  const suggestedQueue = typeof body.suggestedQueue === 'string' ? body.suggestedQueue : null;
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const distribution = normalizeDistributionStrategies(
+    (settings.agentStrategies as Record<string, unknown> | undefined)?.distribution
+  );
+
+  let leadStage = stage;
+  let leadTags = tags;
+
+  if (leadId) {
+    const lead = await prisma.lead.findFirst({
+      where: { id: leadId, organizationId: c.get('tenantId') },
+      select: { stage: true, tags: true },
+    });
+    if (lead) {
+      leadStage = lead.stage;
+      leadTags = lead.tags;
+    }
+  }
+
+  const decision = selectDistributionTarget({
+    distribution,
+    lead: { stage: leadStage, tags: leadTags },
+    suggestedQueue,
+  });
+
+  return c.json({
+    decision: {
+      target: decision.target,
+      rationale: decision.rationale,
+    },
+  });
+});
+
+api.get('/v1/agent/assignments', async (c) => {
+  const leadId = c.req.query('leadId');
+  const limitRaw = c.req.query('limit');
+  const limit = Math.min(200, Math.max(1, Number(limitRaw ?? 50)));
+
+  const logs = await prisma.leadAssignmentLog.findMany({
+    where: {
+      organizationId: c.get('tenantId'),
+      ...(leadId ? { leadId } : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    include: {
+      lead: { select: { id: true, stage: true } },
+    },
+  });
+
+  return c.json({ assignments: logs });
+});
+
+api.get('/v1/agent/optimizations/preview', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const strategies = normalizeOptimizationStrategies(
+    (settings.agentStrategies as Record<string, unknown> | undefined)?.optimization
+  );
+
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+  const rows = await prisma.analyticsDaily.findMany({
+    where: {
+      organizationId: c.get('tenantId'),
+      date: { gte: start, lt: end },
+      campaignId: { not: null },
+    },
+  });
+
+  const campaignIds = Array.from(
+    new Set(rows.map((row) => row.campaignId).filter((value): value is string => !!value))
+  );
+  const campaigns = campaignIds.length
+    ? await prisma.campaign.findMany({
+        where: { id: { in: campaignIds }, organizationId: c.get('tenantId') },
+        select: { id: true, cost: true, revenue: true },
+      })
+    : [];
+
+  const recommendations = evaluateOptimizationStrategies({
+    strategies,
+    analytics: rows,
+    campaigns,
+  });
+
+  return c.json({ range: { start: start.toISOString(), end: end.toISOString() }, recommendations });
+});
+
+api.get('/v1/knowledge-sources', async (c) => {
+  const sources = await prisma.knowledgeSource.findMany({
+    where: { organizationId: c.get('tenantId') },
+    orderBy: { createdAt: 'desc' },
+    include: {
+      _count: { select: { chunks: true } },
+    },
+  });
+
+  return c.json({ sources });
+});
+
+api.post('/v1/knowledge-sources', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const description = typeof body.description === 'string' ? body.description.trim() : null;
+  const kind = typeof body.kind === 'string' && body.kind.trim().length > 0 ? body.kind.trim() : 'text';
+  const config =
+    body.config && typeof body.config === 'object' && !Array.isArray(body.config)
+      ? (body.config as Record<string, unknown>)
+      : null;
+
+  if (!name) {
+    return c.json({ error: 'name_required' }, 400);
+  }
+
+  const source = await prisma.knowledgeSource.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      name,
+      description,
+      kind,
+      config,
+    },
+  });
+
+  return c.json({ source });
+});
+
+api.post('/v1/knowledge-sources/:id/chunks', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const content = typeof body.content === 'string' ? body.content.trim() : '';
+  const chunkSize =
+    typeof body.chunkSize === 'number' && body.chunkSize > 0 ? Math.floor(body.chunkSize) : 600;
+  const metadata =
+    body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+      ? (body.metadata as Record<string, unknown>)
+      : null;
+
+  if (!content) {
+    return c.json({ error: 'content_required' }, 400);
+  }
+
+  const source = await prisma.knowledgeSource.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!source) {
+    return c.json({ error: 'source_not_found' }, 404);
+  }
+
+  const chunks = splitContentIntoChunks(content, chunkSize);
+  if (chunks.length === 0) {
+    return c.json({ error: 'no_chunks' }, 400);
+  }
+
+  await prisma.knowledgeChunk.createMany({
+    data: chunks.map((chunk, index) => ({
+      organizationId: c.get('tenantId'),
+      sourceId: source.id,
+      content: chunk,
+      metadata: metadata ? { ...metadata, chunkIndex: index } : { chunkIndex: index },
+    })),
+  });
+
+  return c.json({ created: chunks.length });
+});
+
+api.post('/v1/knowledge/retrieve', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const query = typeof body.query === 'string' ? body.query : '';
+  const topK = typeof body.topK === 'number' && body.topK > 0 ? Math.floor(body.topK) : 5;
+  const sourceIds = Array.isArray(body.sourceIds)
+    ? body.sourceIds.filter((id) => typeof id === 'string')
+    : undefined;
+
+  if (!query.trim()) {
+    return c.json({ error: 'query_required' }, 400);
+  }
+
+  const results = await retrieveKnowledgeChunks({
+    organizationId: c.get('tenantId'),
+    query,
+    topK,
+    sourceIds,
+  });
+
+  return c.json({ results });
 });
 
 api.get('/v1/analytics/summary', async (c) => {
@@ -1055,6 +2302,137 @@ api.get('/v1/analytics/trends/campaigns', async (c) => {
   });
 });
 
+api.get('/v1/agent/optimizations', async (c) => {
+  const status = c.req.query('status');
+  const campaignId = c.req.query('campaignId');
+
+  const where: Prisma.CampaignOptimizationWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(status ? { status } : {}),
+    ...(campaignId ? { campaignId } : {}),
+  };
+
+  const optimizations = await prisma.campaignOptimization.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: {
+      campaign: { select: { id: true, name: true, status: true, cost: true, revenue: true } },
+    },
+  });
+
+  return c.json({ optimizations });
+});
+
+api.post('/v1/agent/optimizations/:id/apply', async (c) => {
+  const optimization = await prisma.campaignOptimization.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+    include: { campaign: true },
+  });
+
+  if (!optimization) {
+    return c.json({ error: 'optimization_not_found' }, 404);
+  }
+
+  if (optimization.status !== 'pending') {
+    return c.json({ optimization });
+  }
+
+  const campaignMetadata =
+    optimization.campaign.metadata && typeof optimization.campaign.metadata === 'object' && !Array.isArray(optimization.campaign.metadata)
+      ? { ...(optimization.campaign.metadata as Record<string, unknown>) }
+      : {};
+
+  const appliedList = Array.isArray(campaignMetadata.optimizationsApplied)
+    ? [...campaignMetadata.optimizationsApplied]
+    : [];
+
+  appliedList.push({
+    id: optimization.id,
+    type: optimization.type,
+    appliedAt: new Date().toISOString(),
+  });
+
+  campaignMetadata.optimizationsApplied = appliedList;
+
+  await prisma.campaign.update({
+    where: { id: optimization.campaignId },
+    data: {
+      metadata: campaignMetadata,
+    },
+  });
+
+  const updated = await prisma.campaignOptimization.update({
+    where: { id: optimization.id },
+    data: {
+      status: 'applied',
+      appliedAt: new Date(),
+    },
+  });
+
+  return c.json({ optimization: updated });
+});
+
+api.post('/v1/agent/optimizations/:id/dismiss', async (c) => {
+  const optimization = await prisma.campaignOptimization.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!optimization) {
+    return c.json({ error: 'optimization_not_found' }, 404);
+  }
+
+  if (optimization.status !== 'pending') {
+    return c.json({ optimization });
+  }
+
+  const updated = await prisma.campaignOptimization.update({
+    where: { id: optimization.id },
+    data: {
+      status: 'dismissed',
+    },
+  });
+
+  return c.json({ optimization: updated });
+});
+
+api.get('/v1/agent/runs', async (c) => {
+  const type = c.req.query('type');
+  const leadId = c.req.query('leadId');
+  const campaignId = c.req.query('campaignId');
+
+  const where: Prisma.AgentRunWhereInput = {
+    organizationId: c.get('tenantId'),
+    ...(type ? { type } : {}),
+    ...(leadId ? { leadId } : {}),
+    ...(campaignId ? { campaignId } : {}),
+  };
+
+  const runs = await prisma.agentRun.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
+  return c.json({ runs });
+});
+
+api.get('/v1/agent/runs/:id/steps', async (c) => {
+  const run = await prisma.agentRun.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!run) {
+    return c.json({ error: 'run_not_found' }, 404);
+  }
+
+  const steps = await prisma.agentRunStep.findMany({
+    where: { runId: run.id },
+    orderBy: { stepIndex: 'asc' },
+  });
+
+  return c.json({ run, steps });
+});
+
 api.get('/v1/agent-tools', async (c) => {
   const tools = await prisma.toolDefinition.findMany({
     where: { organizationId: c.get('tenantId') },
@@ -1184,7 +2562,7 @@ api.post('/v1/agent-tools/:id/execute', async (c) => {
     } as ToolExecutionRequest);
   }
 
-  await prisma.toolExecutionLog.create({
+  const executionLog = await prisma.toolExecutionLog.create({
     data: {
       organizationId: c.get('tenantId'),
       toolId: tool.id,
@@ -1194,6 +2572,28 @@ api.post('/v1/agent-tools/:id/execute', async (c) => {
       errorMessage: result.error ?? null,
       requestPayload: { inputs, context },
       responsePayload: result.outputs ?? null,
+    },
+  });
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const langfuse = normalizeLangfuseSettings(settings.langfuse);
+  await sendLangfuseTrace(langfuse, {
+    id: executionLog.id,
+    name: `tool:${tool.name}`,
+    input: {
+      toolId: tool.id,
+      toolName: tool.name,
+      agentId,
+      inputs,
+      context,
+    },
+    output: {
+      status: result.status,
+      error: result.error ?? null,
+      outputs: result.outputs ?? null,
+    },
+    metadata: {
+      latencyMs: result.latencyMs ?? null,
     },
   });
 
@@ -1318,6 +2718,54 @@ api.get('/v1/prompts', async (c) => {
   return c.json({ prompts });
 });
 
+api.get('/v1/langfuse', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const langfuse = normalizeLangfuseSettings(settings.langfuse);
+
+  return c.json({
+    langfuse: {
+      enabled: langfuse.enabled,
+      baseUrl: langfuse.baseUrl,
+      publicKey: langfuse.publicKey ? `${langfuse.publicKey.slice(0, 4)}...` : '',
+      secretKey: langfuse.secretKey ? '***' : '',
+    },
+  });
+});
+
+api.put('/v1/langfuse', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const incoming = normalizeLangfuseSettings(body.langfuse ?? body);
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const current = normalizeLangfuseSettings(settings.langfuse);
+
+  const langfuse = {
+    enabled: incoming.enabled,
+    baseUrl: incoming.baseUrl,
+    publicKey: incoming.publicKey || current.publicKey,
+    secretKey: incoming.secretKey || current.secretKey,
+  };
+
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        langfuse,
+      },
+    },
+  });
+
+  return c.json({
+    langfuse: {
+      enabled: langfuse.enabled,
+      baseUrl: langfuse.baseUrl,
+      publicKey: langfuse.publicKey ? `${langfuse.publicKey.slice(0, 4)}...` : '',
+      secretKey: langfuse.secretKey ? '***' : '',
+    },
+  });
+});
+
 api.get('/v1/prompts/metrics', async (c) => {
   const name = c.req.query('name');
   const promptId = c.req.query('promptId');
@@ -1398,6 +2846,25 @@ api.post('/v1/prompts/:id/usage', async (c) => {
     },
   });
 
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const langfuse = normalizeLangfuseSettings(settings.langfuse);
+  await sendLangfuseTrace(langfuse, {
+    id: usage.id,
+    name: `prompt:${prompt.name}`,
+    input: {
+      promptId: prompt.id,
+      promptVersion: prompt.version,
+      agentId,
+      metadata,
+    },
+    output: {
+      outcome,
+    },
+    metadata: {
+      latencyMs,
+    },
+  });
+
   return c.json({ usage }, 201);
 });
 
@@ -1447,6 +2914,247 @@ api.put('/v1/prompts/:id', async (c) => {
   });
 
   return c.json({ prompt: updated });
+});
+
+api.post('/v1/crm/leads/:id', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const leadId = c.req.param('id');
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const fieldMapping = normalizeCrmFieldMapping(settings.crmFieldMapping);
+
+  const lead = await prisma.lead.findFirst({
+    where: { id: leadId, organizationId: c.get('tenantId') },
+  });
+
+  if (!lead) {
+    return c.json({ error: 'lead_not_found' }, 404);
+  }
+
+  const updates: Record<string, unknown> = {};
+  if (typeof body.stage === 'string') {
+    updates.stage = body.stage;
+  }
+  if (Array.isArray(body.tags)) {
+    updates.tags = body.tags.filter((tag) => typeof tag === 'string');
+  }
+  if (typeof body.source === 'string') {
+    updates.source = body.source;
+  }
+  if (body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)) {
+    updates.metadata = body.metadata as Record<string, unknown>;
+  }
+  if (typeof body.crmExternalId === 'string') {
+    updates.crmExternalId = body.crmExternalId.trim();
+  }
+
+  if (fieldMapping && Object.keys(fieldMapping).length > 0) {
+    const existingMetadata =
+      updates.metadata && typeof updates.metadata === 'object' && !Array.isArray(updates.metadata)
+        ? (updates.metadata as Record<string, unknown>)
+        : lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
+          ? (lead.metadata as Record<string, unknown>)
+          : null;
+
+    updates.metadata = applyCrmMetadataMapping(existingMetadata, body, fieldMapping);
+  }
+
+  const updatedLead = await applyLeadUpdate(lead, updates);
+
+  return c.json({ lead: updatedLead });
+});
+
+api.post('/v1/crm/revenue', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const amount = typeof body.amount === 'number' ? body.amount : NaN;
+  const currency = normalizeCurrency(body.currency) ?? 'USD';
+  const source = typeof body.source === 'string' ? body.source.trim() : 'crm';
+  const externalId = typeof body.externalId === 'string' ? body.externalId.trim() : null;
+  const occurredAtRaw = body.occurredAt;
+  const occurredAt =
+    typeof occurredAtRaw === 'string' || typeof occurredAtRaw === 'number'
+      ? new Date(occurredAtRaw)
+      : new Date();
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return c.json({ error: 'invalid_amount' }, 400);
+  }
+
+  const leadId = typeof body.leadId === 'string' ? body.leadId : null;
+  const campaignId = typeof body.campaignId === 'string' ? body.campaignId : null;
+
+  const lead = leadId
+    ? await prisma.lead.findFirst({
+        where: { id: leadId, organizationId: c.get('tenantId') },
+      })
+    : null;
+
+  if (leadId && !lead) {
+    return c.json({ error: 'lead_not_found' }, 404);
+  }
+
+  const campaign = campaignId
+    ? await prisma.campaign.findFirst({
+        where: { id: campaignId, organizationId: c.get('tenantId') },
+      })
+    : null;
+
+  if (campaignId && !campaign) {
+    return c.json({ error: 'campaign_not_found' }, 404);
+  }
+
+  let resolvedCampaign = campaign;
+  if (!resolvedCampaign && lead) {
+    const attribution = await prisma.leadAttribution.findUnique({
+      where: { leadId_model: { leadId: lead.id, model: 'last_touch' } },
+    });
+    if (attribution?.campaignId) {
+      resolvedCampaign = await prisma.campaign.findFirst({
+        where: { id: attribution.campaignId, organizationId: c.get('tenantId') },
+      });
+    }
+  }
+
+  const revenueEvent = await prisma.revenueEvent.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      leadId: lead?.id ?? null,
+      campaignId: resolvedCampaign?.id ?? null,
+      amount,
+      currency,
+      source,
+      externalId,
+      occurredAt,
+      metadata:
+        body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+          ? (body.metadata as Record<string, unknown>)
+          : null,
+    },
+  });
+
+  if (resolvedCampaign) {
+    await prisma.campaign.update({
+      where: { id: resolvedCampaign.id },
+      data: { revenue: (resolvedCampaign.revenue ?? 0) + amount },
+    });
+  }
+
+  return c.json({ revenueEvent }, 201);
+});
+
+api.put('/v1/campaigns/:id/roi', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const cost = typeof body.cost === 'number' ? body.cost : null;
+  const revenue = typeof body.revenue === 'number' ? body.revenue : null;
+
+  const campaign = await prisma.campaign.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!campaign) {
+    return c.json({ error: 'campaign_not_found' }, 404);
+  }
+
+  const updated = await prisma.campaign.update({
+    where: { id: campaign.id },
+    data: {
+      cost: cost ?? campaign.cost,
+      revenue: revenue ?? campaign.revenue,
+    },
+  });
+
+  return c.json({ campaign: updated });
+});
+
+api.get('/v1/crm/mapping', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const mapping = normalizeCrmFieldMapping(settings.crmFieldMapping);
+
+  return c.json({ mapping });
+});
+
+api.get('/v1/crm/mapping/examples', async (c) => {
+  const examples = [
+    {
+      id: 'hubspot-deal',
+      name: 'HubSpot Deal Sync',
+      description: 'Map common HubSpot deal fields into metadata.',
+      mapping: {
+        hs_deal_id: 'crm.dealId',
+        hs_deal_amount: 'crm.dealAmount',
+        hs_deal_stage: 'crm.dealStage',
+        hs_close_date: 'crm.closeDate',
+      },
+    },
+    {
+      id: 'salesforce-oppty',
+      name: 'Salesforce Opportunity',
+      description: 'Map common Salesforce opportunity fields.',
+      mapping: {
+        Id: 'crm.opportunityId',
+        Amount: 'crm.amount',
+        StageName: 'crm.stage',
+        CloseDate: 'crm.closeDate',
+      },
+    },
+    {
+      id: 'custom-minimal',
+      name: 'Minimal',
+      description: 'Minimal mapping for custom CRM payloads.',
+      mapping: {
+        dealValue: 'crm.dealValue',
+        owner: 'crm.owner',
+      },
+    },
+  ];
+
+  return c.json({ examples });
+});
+
+api.post('/v1/crm/mapping/validate', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const mapping = normalizeCrmFieldMapping(body.mapping ?? body);
+  const result = validateCrmFieldMapping(mapping);
+  return c.json(result, result.valid ? 200 : 400);
+});
+
+api.post('/v1/crm/mapping/preview', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const mapping = normalizeCrmFieldMapping(body.mapping ?? body);
+  const validation = validateCrmFieldMapping(mapping);
+  if (!validation.valid) {
+    return c.json(validation, 400);
+  }
+
+  const payload =
+    body.payload && typeof body.payload === 'object' && !Array.isArray(body.payload)
+      ? (body.payload as Record<string, unknown>)
+      : {};
+
+  const output = applyCrmMetadataMapping({}, payload, mapping);
+  return c.json({ output });
+});
+
+api.put('/v1/crm/mapping', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const mapping = normalizeCrmFieldMapping(body.mapping ?? body);
+  const validation = validateCrmFieldMapping(mapping);
+
+  if (!validation.valid) {
+    return c.json(validation, 400);
+  }
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        crmFieldMapping: mapping,
+      },
+    },
+  });
+
+  return c.json({ mapping });
 });
 
 api.get('/v1/crm/webhook', async (c) => {
@@ -1553,6 +3261,7 @@ api.post('/v1/leads/:id/signals', async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
   const signals = normalizeTags(body.signals);
   const text = typeof body.text === 'string' ? body.text : undefined;
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
 
   if (signals.length === 0 && !text) {
     return c.json({ error: 'invalid_payload' }, 400);
@@ -1569,54 +3278,132 @@ api.post('/v1/leads/:id/signals', async (c) => {
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   const leadRules = getLeadRulesFromSettings(settings);
 
-  if (leadRules.length === 0) {
-    return c.json({ lead, matchedRules: [], updates: {} });
+  let updatedLead = lead;
+  let ruleResult: ReturnType<typeof applyLeadRules> | null = null;
+  let ruleUpdates: Record<string, unknown> = {};
+
+  if (leadRules.length > 0) {
+    ruleResult = applyLeadRules(
+      {
+        tags: updatedLead.tags,
+        stage: updatedLead.stage,
+        score: updatedLead.score,
+        source: updatedLead.source,
+        metadata:
+          updatedLead.metadata && typeof updatedLead.metadata === 'object' && !Array.isArray(updatedLead.metadata)
+            ? (updatedLead.metadata as Record<string, unknown>)
+            : null,
+      },
+      leadRules,
+      { text, signals }
+    );
+
+    if (Object.keys(ruleResult.updates).length > 0) {
+      ruleUpdates = applyConversionUpdate(updatedLead.stage, ruleResult.updates);
+      updatedLead = await prisma.lead.update({
+        where: { id: updatedLead.id },
+        data: {
+          ...ruleUpdates,
+          lastActivityAt: new Date(),
+        },
+      });
+    }
   }
 
-  const ruleResult = applyLeadRules(
-    {
-      tags: lead.tags,
-      stage: lead.stage,
-      score: lead.score,
-      source: lead.source,
-      metadata:
-        lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
-          ? (lead.metadata as Record<string, unknown>)
-          : null,
-    },
-    leadRules,
-    { text, signals }
-  );
-
-  if (Object.keys(ruleResult.updates).length === 0) {
-    return c.json({ lead, matchedRules: ruleResult.matchedRules, updates: {} });
-  }
-
-  const updates = applyConversionUpdate(lead.stage, ruleResult.updates);
-  const updatedLead = await prisma.lead.update({
-    where: { id: lead.id },
-    data: {
-      ...updates,
-      lastActivityAt: new Date(),
-    },
+  const agentResult = await runLeadAgentWorkflow({
+    organizationId: c.get('tenantId'),
+    leadId: updatedLead.id,
+    text,
+    signals,
+    sessionId,
   });
 
-  await enqueueCrmWebhook(
-    c.get('tenantId'),
-    'lead.updated',
-    {
-      lead: updatedLead,
-      matchedRules: ruleResult.matchedRules,
-      changes: updates,
-      signals,
-    },
-    settings
-  );
+  if (agentResult.lead) {
+    updatedLead = agentResult.lead;
+  }
+
+  const combinedUpdates = {
+    ...ruleUpdates,
+    ...(agentResult.updates ?? {}),
+  };
+
+  if (Object.keys(combinedUpdates).length > 0) {
+    await enqueueCrmWebhook(
+      c.get('tenantId'),
+      'lead.updated',
+      {
+        lead: updatedLead,
+        matchedRules: ruleResult?.matchedRules ?? [],
+        changes: combinedUpdates,
+        signals,
+        agent: agentResult.decision
+          ? {
+              runId: agentResult.runId,
+              updates: agentResult.updates,
+              rationale: agentResult.decision.rationale,
+            }
+          : null,
+      },
+      settings
+    );
+  }
 
   return c.json({
     lead: updatedLead,
-    matchedRules: ruleResult.matchedRules,
-    updates,
+    matchedRules: ruleResult?.matchedRules ?? [],
+    updates: combinedUpdates,
+    agent: agentResult.decision
+      ? {
+          runId: agentResult.runId,
+          updates: agentResult.updates,
+          rationale: agentResult.decision.rationale,
+          assignmentQueue: agentResult.decision.assignmentQueue,
+        }
+      : null,
+  });
+});
+
+api.post('/v1/agent/leads/:id/score', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const signals = normalizeTags(body.signals);
+  const text = typeof body.text === 'string' ? body.text : undefined;
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+
+  if (signals.length === 0 && !text) {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const lead = await prisma.lead.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!lead) {
+    return c.json({ error: 'lead_not_found' }, 404);
+  }
+
+  const agentResult = await runLeadAgentWorkflow({
+    organizationId: c.get('tenantId'),
+    leadId: lead.id,
+    text,
+    signals,
+    sessionId,
+  });
+
+  if (!agentResult.lead) {
+    return c.json({ error: 'lead_not_found' }, 404);
+  }
+
+  return c.json({
+    lead: agentResult.lead,
+    updates: agentResult.updates,
+    agent: agentResult.decision
+      ? {
+          runId: agentResult.runId,
+          updates: agentResult.updates,
+          rationale: agentResult.decision.rationale,
+          assignmentQueue: agentResult.decision.assignmentQueue,
+        }
+      : null,
   });
 });
 

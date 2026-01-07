@@ -1,6 +1,7 @@
 import { prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getAgentAdapter, selectAgent, type AgentContext, type AgentRoutingConfig } from '@omini/agent-routing';
+import { Langfuse } from 'langfuse';
 
 export type AgentReplyJob = {
   context: AgentContext;
@@ -15,6 +16,72 @@ const loadOrganizationSettings = async (organizationId: string) => {
   });
 
   return (organization?.settings as Record<string, unknown>) ?? {};
+};
+
+const normalizeLangfuseSettings = (input: unknown) => {
+  if (!input || typeof input !== 'object') {
+    return {
+      enabled: false,
+      baseUrl: 'https://cloud.langfuse.com',
+      publicKey: '',
+      secretKey: '',
+    };
+  }
+
+  const settings = input as Record<string, unknown>;
+  const enabled = typeof settings.enabled === 'boolean' ? settings.enabled : false;
+  const baseUrl =
+    typeof settings.baseUrl === 'string' && settings.baseUrl.trim().length > 0
+      ? settings.baseUrl.trim()
+      : 'https://cloud.langfuse.com';
+  const publicKey = typeof settings.publicKey === 'string' ? settings.publicKey.trim() : '';
+  const secretKey = typeof settings.secretKey === 'string' ? settings.secretKey.trim() : '';
+
+  return {
+    enabled,
+    baseUrl: baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl,
+    publicKey,
+    secretKey,
+  };
+};
+
+const langfuseClients = new Map<string, Langfuse>();
+
+const getLangfuseClient = (settings: ReturnType<typeof normalizeLangfuseSettings>) => {
+  if (!settings.enabled || !settings.publicKey || !settings.secretKey) {
+    return null;
+  }
+
+  const key = `${settings.baseUrl}|${settings.publicKey}|${settings.secretKey}`;
+  const existing = langfuseClients.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const client = new Langfuse({
+    publicKey: settings.publicKey,
+    secretKey: settings.secretKey,
+    baseUrl: settings.baseUrl,
+  });
+  langfuseClients.set(key, client);
+  return client;
+};
+
+const sendLangfuseTrace = async (
+  settings: ReturnType<typeof normalizeLangfuseSettings>,
+  payload: Record<string, unknown>
+) => {
+  const client = getLangfuseClient(settings);
+  if (!client) {
+    return;
+  }
+
+  try {
+    client.trace(payload as Parameters<Langfuse['trace']>[0]);
+    await client.flushAsync();
+  } catch (error) {
+    console.warn('Langfuse trace failed', error);
+  }
 };
 
 const getAgentRoutingConfig = (settings: Record<string, unknown>): AgentRoutingConfig => {
@@ -86,6 +153,28 @@ export const registerAgentRepliesWorker = () =>
           ruleId: decision.matchedRuleId ?? null,
           metadata: response.metadata ?? null,
         },
+      },
+    });
+
+    const langfuse = normalizeLangfuseSettings(settings.langfuse);
+    await sendLangfuseTrace(langfuse, {
+      id: message.id,
+      name: `agent.reply:${adapter.id}`,
+      input: {
+        agentId: adapter.id,
+        conversationId: data.context.conversationId,
+        contactId: data.context.contactId,
+        leadId: data.context.leadId ?? null,
+        text: data.context.text ?? '',
+        tags: data.context.tags ?? [],
+        stage: data.context.stage ?? null,
+        source: data.context.source ?? null,
+      },
+      output: {
+        text: response.text ?? '',
+      },
+      metadata: {
+        ruleId: decision.matchedRuleId ?? null,
       },
     });
 

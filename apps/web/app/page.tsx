@@ -482,10 +482,16 @@ export default function Home() {
                 <Link href="/analytics">Analytics</Link>
               </Button>
               <Button variant="outline" asChild>
+                <Link href="/agent-intel">Agent</Link>
+              </Button>
+              <Button variant="outline" asChild>
                 <Link href="/tools">Tools</Link>
               </Button>
               <Button variant="outline" asChild>
                 <Link href="/prompts">Prompts</Link>
+              </Button>
+              <Button variant="outline" asChild>
+                <Link href="/roi">ROI/CRM</Link>
               </Button>
             </div>
           </div>
