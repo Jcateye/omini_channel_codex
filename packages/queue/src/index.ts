@@ -56,6 +56,7 @@ export const QUEUE_NAMES = {
   campaignSends: 'campaign.sends',
   agentReplies: 'agent.replies',
   analyticsMetrics: 'analytics.metrics',
+  knowledgeSync: 'knowledge.sync',
 } as const;
 
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];

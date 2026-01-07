@@ -40,6 +40,7 @@ const inboundQueue = createQueue(QUEUE_NAMES.inboundEvents);
 const crmQueue = createQueue(QUEUE_NAMES.crmWebhooks);
 const outboundQueue = createQueue(QUEUE_NAMES.outboundMessages);
 const statusQueue = createQueue(QUEUE_NAMES.statusEvents);
+const knowledgeQueue = createQueue(QUEUE_NAMES.knowledgeSync);
 
 const leadStages = new Set(['new', 'qualified', 'nurtured', 'converted', 'lost']);
 const supportedPlatforms = new Set(['whatsapp', 'twitter', 'instagram', 'tiktok']);
@@ -363,6 +364,231 @@ const normalizeDistributionStrategies = (input: unknown) => {
   };
 };
 
+const normalizeAgentHandoffConfig = (input: unknown) => {
+  const defaults = {
+    enabled: true,
+    roles: [
+      { id: 'sales', name: 'Sales' },
+      { id: 'support', name: 'Support' },
+      { id: 'ops', name: 'Ops' },
+    ],
+    stageRoles: {
+      new: 'ops',
+      qualified: 'sales',
+      nurtured: 'sales',
+      converted: 'ops',
+      lost: 'support',
+    },
+    rules: [
+      { id: 'score_sales', type: 'score', minScore: 50, targetRole: 'sales', enabled: true },
+      { id: 'tag_support', type: 'tag', tagsAny: ['complaint', 'refund'], targetRole: 'support', enabled: true },
+      { id: 'task_support', type: 'task', tasksAny: ['support', 'refund'], targetRole: 'support', enabled: true },
+      { id: 'confidence_high', type: 'confidence', minConfidence: 0.7, targetRole: 'sales', enabled: true },
+    ],
+    contextAllowlist: [
+      'lead.id',
+      'lead.stage',
+      'lead.tags',
+      'lead.score',
+      'lead.source',
+      'lead.metadata.assignmentQueue',
+      'context.taskType',
+      'context.confidence',
+      'context.matchedRuleIds',
+    ],
+  };
+
+  if (!input || typeof input !== 'object') {
+    return defaults;
+  }
+
+  const raw = input as Record<string, unknown>;
+  const enabled = raw.enabled !== false;
+  const roles = Array.isArray(raw.roles)
+    ? raw.roles
+        .filter((role) => role && typeof role === 'object')
+        .map((role) => {
+          const item = role as Record<string, unknown>;
+          const id = typeof item.id === 'string' ? item.id.trim() : '';
+          const name = typeof item.name === 'string' ? item.name.trim() : id;
+          return { id, name };
+        })
+        .filter((role) => role.id.length > 0)
+    : defaults.roles;
+
+  const stageRoles =
+    raw.stageRoles && typeof raw.stageRoles === 'object' && !Array.isArray(raw.stageRoles)
+      ? Object.entries(raw.stageRoles as Record<string, unknown>).reduce(
+          (acc, [key, value]) => {
+            if (typeof value === 'string' && value.trim()) {
+              acc[key] = value.trim();
+            }
+            return acc;
+          },
+          {} as Record<string, string>
+        )
+      : defaults.stageRoles;
+
+  const rules = Array.isArray(raw.rules)
+    ? raw.rules
+        .filter((rule) => rule && typeof rule === 'object')
+        .map((rule) => {
+          const item = rule as Record<string, unknown>;
+          const id = typeof item.id === 'string' ? item.id : `handoff_${createTrackingToken()}`;
+          const type = typeof item.type === 'string' ? item.type : 'score';
+          const targetRole = typeof item.targetRole === 'string' ? item.targetRole : 'sales';
+          const enabled = item.enabled !== false;
+          const minScore = typeof item.minScore === 'number' ? item.minScore : undefined;
+          const minConfidence =
+            typeof item.minConfidence === 'number' ? item.minConfidence : undefined;
+          const tagsAny = Array.isArray(item.tagsAny)
+            ? item.tagsAny.filter((tag) => typeof tag === 'string')
+            : [];
+          const tasksAny = Array.isArray(item.tasksAny)
+            ? item.tasksAny.filter((task) => typeof task === 'string')
+            : [];
+          return { id, type, targetRole, enabled, minScore, minConfidence, tagsAny, tasksAny };
+        })
+    : defaults.rules;
+
+  const contextAllowlist = Array.isArray(raw.contextAllowlist)
+    ? raw.contextAllowlist.filter((entry) => typeof entry === 'string')
+    : defaults.contextAllowlist;
+
+  return {
+    enabled,
+    roles,
+    stageRoles,
+    rules,
+    contextAllowlist,
+  };
+};
+
+const getValueByPath = (source: Record<string, unknown>, path: string) => {
+  const parts = path.split('.').filter((part) => part.length > 0);
+  let current: unknown = source;
+  for (const part of parts) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+};
+
+const setValueByPath = (target: Record<string, unknown>, path: string, value: unknown) => {
+  const parts = path.split('.').filter((part) => part.length > 0);
+  let current = target;
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (i === parts.length - 1) {
+      current[part] = value;
+      return;
+    }
+    if (!current[part] || typeof current[part] !== 'object' || Array.isArray(current[part])) {
+      current[part] = {};
+    }
+    current = current[part] as Record<string, unknown>;
+  }
+};
+
+const applyContextAllowlist = (source: Record<string, unknown>, allowlist: string[]) => {
+  const result: Record<string, unknown> = {};
+  for (const entry of allowlist) {
+    const value = getValueByPath(source, entry);
+    if (value !== undefined) {
+      setValueByPath(result, entry, value);
+    }
+  }
+  return result;
+};
+
+const evaluateHandoff = (input: {
+  config: ReturnType<typeof normalizeAgentHandoffConfig>;
+  lead: {
+    id: string;
+    stage: string;
+    score?: number | null;
+    tags: string[];
+    source?: string | null;
+    metadata?: Record<string, unknown> | null;
+  };
+  context: {
+    matchedRuleIds?: string[];
+    taskType?: string | null;
+    confidence?: number | null;
+  };
+}) => {
+  if (!input.config.enabled) {
+    return { nextRole: null, trigger: null };
+  }
+
+  const currentRole =
+    typeof input.lead.metadata?.agentRole === 'string'
+      ? (input.lead.metadata.agentRole as string)
+      : input.config.stageRoles[input.lead.stage] ?? null;
+
+  const leadTags = input.lead.tags.map((tag) => tag.toLowerCase());
+  const taskType = input.context.taskType?.toLowerCase();
+  const confidence = typeof input.context.confidence === 'number' ? input.context.confidence : null;
+  const score = typeof input.lead.score === 'number' ? input.lead.score : 0;
+
+  for (const rule of input.config.rules) {
+    if (!rule.enabled) continue;
+    if (!rule.targetRole || rule.targetRole === currentRole) continue;
+
+    if (rule.type === 'score' && typeof rule.minScore === 'number' && score >= rule.minScore) {
+      return {
+        nextRole: rule.targetRole,
+        trigger: { type: 'score', ruleId: rule.id, detail: { minScore: rule.minScore, score } },
+      };
+    }
+
+    if (rule.type === 'tag' && rule.tagsAny?.length) {
+      const tagsAny = rule.tagsAny.map((tag) => tag.toLowerCase());
+      if (tagsAny.some((tag) => leadTags.includes(tag))) {
+        return {
+          nextRole: rule.targetRole,
+          trigger: { type: 'tag', ruleId: rule.id, detail: { tagsAny: rule.tagsAny } },
+        };
+      }
+    }
+
+    if (rule.type === 'task' && rule.tasksAny?.length && taskType) {
+      const tasksAny = rule.tasksAny.map((task) => task.toLowerCase());
+      if (tasksAny.includes(taskType)) {
+        return {
+          nextRole: rule.targetRole,
+          trigger: { type: 'task', ruleId: rule.id, detail: { taskType } },
+        };
+      }
+    }
+
+    if (rule.type === 'confidence' && confidence !== null && typeof rule.minConfidence === 'number') {
+      if (confidence >= rule.minConfidence) {
+        return {
+          nextRole: rule.targetRole,
+          trigger: {
+            type: 'confidence',
+            ruleId: rule.id,
+            detail: { minConfidence: rule.minConfidence, confidence },
+          },
+        };
+      }
+    }
+  }
+
+  const stageRole = input.config.stageRoles[input.lead.stage];
+  if (stageRole && stageRole !== currentRole) {
+    return {
+      nextRole: stageRole,
+      trigger: { type: 'stage', ruleId: null, detail: { stage: input.lead.stage } },
+    };
+  }
+
+  return { nextRole: null, trigger: null };
+};
+
 const selectDistributionTarget = (input: {
   distribution: ReturnType<typeof normalizeDistributionStrategies>;
   lead: {
@@ -532,6 +758,165 @@ const splitContentIntoChunks = (content: string, maxLength = 600) => {
   return chunks;
 };
 
+type KnowledgeQueryInput = {
+  organizationId: string;
+  query: string;
+  sourceIds?: string[];
+  topK?: number;
+  minCreatedAt?: Date | null;
+  tags?: string[];
+};
+
+const getOpenAIEmbeddingSettings = () => {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return null;
+  }
+  return {
+    apiKey,
+    baseUrl: process.env.OPENAI_BASE_URL?.trim() || 'https://api.openai.com/v1',
+    model: process.env.OPENAI_EMBEDDING_MODEL?.trim() || 'text-embedding-3-small',
+  };
+};
+
+const requestOpenAIEmbedding = async (input: {
+  text: string;
+  settings: NonNullable<ReturnType<typeof getOpenAIEmbeddingSettings>>;
+}) => {
+  const response = await fetch(`${input.settings.baseUrl}/embeddings`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${input.settings.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: input.settings.model,
+      input: input.text,
+    }),
+  });
+
+  const payloadText = await response.text();
+  const payload = payloadText ? (JSON.parse(payloadText) as Record<string, unknown>) : {};
+
+  if (!response.ok) {
+    const message =
+      (payload?.error as { message?: string } | undefined)?.message ||
+      payloadText ||
+      `OpenAI error (${response.status})`;
+    throw new Error(message);
+  }
+
+  const data = Array.isArray(payload.data) ? payload.data : [];
+  const embedding = data[0]?.embedding;
+  if (!Array.isArray(embedding)) {
+    throw new Error('OpenAI embedding missing');
+  }
+  return embedding as number[];
+};
+
+const getQdrantSettings = () => {
+  const url = process.env.QDRANT_URL?.trim();
+  if (!url) {
+    return null;
+  }
+  return {
+    url,
+    apiKey: process.env.QDRANT_API_KEY?.trim() || '',
+    collection: process.env.QDRANT_COLLECTION?.trim() || 'omini_knowledge',
+  };
+};
+
+const qdrantFetch = async (
+  settings: NonNullable<ReturnType<typeof getQdrantSettings>>,
+  path: string,
+  options?: RequestInit
+) => {
+  const response = await fetch(`${settings.url}${path}`, {
+    ...options,
+    headers: {
+      'content-type': 'application/json',
+      ...(settings.apiKey ? { 'api-key': settings.apiKey } : {}),
+      ...(options?.headers ?? {}),
+    },
+  });
+
+  const payloadText = await response.text();
+  const payload = payloadText ? (JSON.parse(payloadText) as Record<string, unknown>) : {};
+
+  if (!response.ok) {
+    const message =
+      (payload?.status as { error?: string } | undefined)?.error ||
+      payloadText ||
+      `Qdrant error (${response.status})`;
+    const error = new Error(message);
+    (error as Error & { status?: number }).status = response.status;
+    throw error;
+  }
+
+  return payload;
+};
+
+const searchQdrant = async (input: {
+  settings: NonNullable<ReturnType<typeof getQdrantSettings>>;
+  vector: number[];
+  topK: number;
+  organizationId: string;
+  sourceIds?: string[];
+}) => {
+  const filter: { must: Array<Record<string, unknown>> } = {
+    must: [{ key: 'organizationId', match: { value: input.organizationId } }],
+  };
+
+  if (input.sourceIds && input.sourceIds.length > 0) {
+    filter.must.push({
+      key: 'sourceId',
+      match:
+        input.sourceIds.length === 1
+          ? { value: input.sourceIds[0] }
+          : { any: input.sourceIds },
+    });
+  }
+
+  const payload = await qdrantFetch(
+    input.settings,
+    `/collections/${input.settings.collection}/points/search`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        vector: input.vector,
+        limit: input.topK,
+        filter,
+      }),
+    }
+  );
+
+  const result = Array.isArray(payload.result) ? payload.result : [];
+  return result
+    .map((item) => ({
+      id: typeof item?.id === 'string' || typeof item?.id === 'number' ? String(item.id) : null,
+      score: typeof item?.score === 'number' ? item.score : null,
+    }))
+    .filter((item): item is { id: string; score: number } => !!item.id && item.score !== null);
+};
+
+const chunkMatchesTags = (
+  metadata: Prisma.JsonValue | null | undefined,
+  tags?: string[]
+) => {
+  if (!tags || tags.length === 0) {
+    return true;
+  }
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return false;
+  }
+  const value = (metadata as Record<string, unknown>).tags;
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  const normalized = value.filter((tag) => typeof tag === 'string') as string[];
+  return tags.every((tag) => normalized.includes(tag));
+};
+
 const listActiveMemories = async (input: {
   organizationId: string;
   leadId?: string | null;
@@ -589,12 +974,7 @@ const createAgentMemory = async (input: {
   });
 };
 
-const retrieveKnowledgeChunks = async (input: {
-  organizationId: string;
-  query: string;
-  sourceIds?: string[];
-  topK?: number;
-}) => {
+const retrieveKnowledgeChunksKeyword = async (input: KnowledgeQueryInput) => {
   const query = input.query.trim();
   if (!query) {
     return [];
@@ -608,6 +988,10 @@ const retrieveKnowledgeChunks = async (input: {
 
   if (input.sourceIds && input.sourceIds.length > 0) {
     where.sourceId = { in: input.sourceIds };
+  }
+
+  if (input.minCreatedAt) {
+    where.createdAt = { gte: input.minCreatedAt };
   }
 
   if (tokens.length > 0) {
@@ -630,7 +1014,8 @@ const retrieveKnowledgeChunks = async (input: {
       }, 0);
       return { chunk, score };
     })
-    .filter((row) => row.score > 0 || tokens.length === 0);
+    .filter((row) => row.score > 0 || tokens.length === 0)
+    .filter((row) => chunkMatchesTags(row.chunk.metadata, input.tags));
 
   scored.sort((a, b) => b.score - a.score);
   const topK = input.topK ?? 5;
@@ -642,6 +1027,83 @@ const retrieveKnowledgeChunks = async (input: {
     score: row.score,
     metadata: row.chunk.metadata,
   }));
+};
+
+const retrieveKnowledgeChunksVector = async (input: KnowledgeQueryInput) => {
+  const query = input.query.trim();
+  if (!query) {
+    return [];
+  }
+
+  const openai = getOpenAIEmbeddingSettings();
+  const qdrant = getQdrantSettings();
+  if (!openai || !qdrant) {
+    return null;
+  }
+
+  try {
+    const vector = await requestOpenAIEmbedding({ text: query, settings: openai });
+    const topK = input.topK ?? 5;
+    const hits = await searchQdrant({
+      settings: qdrant,
+      vector,
+      topK,
+      organizationId: input.organizationId,
+      sourceIds: input.sourceIds,
+    });
+
+    if (hits.length === 0) {
+      return [];
+    }
+
+    const chunkIds = hits.map((hit) => hit.id);
+    const chunks = await prisma.knowledgeChunk.findMany({
+      where: {
+        id: { in: chunkIds },
+        organizationId: input.organizationId,
+        source: { enabled: true },
+        ...(input.minCreatedAt ? { createdAt: { gte: input.minCreatedAt } } : {}),
+        ...(input.sourceIds && input.sourceIds.length > 0
+          ? { sourceId: { in: input.sourceIds } }
+          : {}),
+      },
+    });
+
+    const chunkMap = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+    const ordered = hits
+      .map((hit) => {
+        const chunk = chunkMap.get(hit.id);
+        if (!chunk) return null;
+        if (!chunkMatchesTags(chunk.metadata, input.tags)) {
+          return null;
+        }
+        return {
+          id: chunk.id,
+          sourceId: chunk.sourceId,
+          content: chunk.content,
+          score: hit.score,
+          metadata: chunk.metadata,
+        };
+      })
+      .filter(
+        (item): item is { id: string; sourceId: string; content: string; score: number; metadata: Prisma.JsonValue | null | undefined } =>
+          !!item
+      );
+
+    return ordered;
+  } catch (error) {
+    console.warn('Vector retrieval failed, falling back to keyword search', error);
+    return null;
+  }
+};
+
+const retrieveKnowledgeChunks = async (input: KnowledgeQueryInput) => {
+  const vectorResults = await retrieveKnowledgeChunksVector(input);
+  if (vectorResults && vectorResults.length > 0) {
+    return vectorResults;
+  }
+
+  return retrieveKnowledgeChunksKeyword(input);
 };
 
 const evaluateOptimizationStrategies = (input: {
@@ -953,6 +1415,9 @@ const runLeadAgentWorkflow = async (input: {
   text?: string;
   signals?: string[];
   sessionId?: string | null;
+  matchedRuleIds?: string[];
+  taskType?: string | null;
+  confidence?: number | null;
 }) => {
   const lead = await prisma.lead.findUnique({
     where: { id: input.leadId },
@@ -967,6 +1432,7 @@ const runLeadAgentWorkflow = async (input: {
   const distributionSettings = normalizeDistributionStrategies(
     (settings.agentStrategies as Record<string, unknown> | undefined)?.distribution
   );
+  const handoffConfig = normalizeAgentHandoffConfig(settings.agentHandoffs);
 
   const run = await prisma.agentRun.create({
     data: {
@@ -1117,16 +1583,59 @@ const runLeadAgentWorkflow = async (input: {
 
   let updatedLead = lead;
   const mergedUpdates = { ...decision.updates };
+  const baseMetadata =
+    lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
+      ? { ...(lead.metadata as Record<string, unknown>) }
+      : {};
+  let nextMetadata = { ...baseMetadata };
+  let metadataChanged = false;
 
   if (distributionDecision.target) {
-    const existingMetadata =
-      lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
-        ? { ...(lead.metadata as Record<string, unknown>) }
-        : {};
-    existingMetadata.assignmentQueue = distributionDecision.target.id;
-    existingMetadata.assignmentStrategy = distributionSettings.mode;
-    existingMetadata.assignmentRationale = distributionDecision.rationale;
-    mergedUpdates.metadata = existingMetadata;
+    nextMetadata.assignmentQueue = distributionDecision.target.id;
+    nextMetadata.assignmentStrategy = distributionSettings.mode;
+    nextMetadata.assignmentRationale = distributionDecision.rationale;
+    metadataChanged = true;
+  }
+
+  const nextLeadStage =
+    typeof mergedUpdates.stage === 'string' ? mergedUpdates.stage : lead.stage;
+  const nextLeadTags = Array.isArray(mergedUpdates.tags) ? mergedUpdates.tags : lead.tags;
+  const nextLeadScore =
+    typeof mergedUpdates.score === 'number' ? mergedUpdates.score : lead.score ?? null;
+  const nextLeadSource =
+    typeof mergedUpdates.source === 'string' ? mergedUpdates.source : lead.source ?? null;
+
+  const currentRole =
+    typeof baseMetadata.agentRole === 'string'
+      ? (baseMetadata.agentRole as string)
+      : handoffConfig.stageRoles[lead.stage] ?? null;
+
+  const handoffDecision = evaluateHandoff({
+    config: handoffConfig,
+    lead: {
+      id: lead.id,
+      stage: nextLeadStage,
+      score: nextLeadScore,
+      tags: nextLeadTags,
+      source: nextLeadSource,
+      metadata: nextMetadata,
+    },
+    context: {
+      matchedRuleIds: input.matchedRuleIds ?? [],
+      taskType: input.taskType ?? null,
+      confidence: input.confidence ?? null,
+    },
+  });
+
+  if (handoffDecision.nextRole && handoffDecision.nextRole !== currentRole) {
+    nextMetadata.agentRole = handoffDecision.nextRole;
+    nextMetadata.agentRoleAt = new Date().toISOString();
+    nextMetadata.handoffReason = handoffDecision.trigger;
+    metadataChanged = true;
+  }
+
+  if (metadataChanged) {
+    mergedUpdates.metadata = nextMetadata;
   }
 
   if (Object.keys(mergedUpdates).length > 0) {
@@ -1146,6 +1655,40 @@ const runLeadAgentWorkflow = async (input: {
         metadata: {
           suggestedQueue: decision.assignmentQueue ?? null,
         },
+      },
+    });
+  }
+
+  if (handoffDecision.nextRole && handoffDecision.nextRole !== currentRole) {
+    const sharedContext = applyContextAllowlist(
+      {
+        lead: {
+          id: lead.id,
+          stage: nextLeadStage,
+          score: nextLeadScore,
+          tags: nextLeadTags,
+          source: nextLeadSource,
+          metadata: nextMetadata,
+        },
+        context: {
+          matchedRuleIds: input.matchedRuleIds ?? [],
+          taskType: input.taskType ?? null,
+          confidence: input.confidence ?? null,
+        },
+      },
+      handoffConfig.contextAllowlist
+    );
+
+    await prisma.agentHandoffLog.create({
+      data: {
+        organizationId: input.organizationId,
+        leadId: lead.id,
+        fromRole: currentRole,
+        toRole: handoffDecision.nextRole,
+        triggerType: handoffDecision.trigger?.type ?? 'unknown',
+        triggerRuleId: handoffDecision.trigger?.ruleId ?? null,
+        triggerDetail: handoffDecision.trigger?.detail ?? null,
+        contextShared: sharedContext,
       },
     });
   }
@@ -1187,6 +1730,7 @@ const runLeadAgentWorkflow = async (input: {
         updates: mergedUpdates,
         rationale: decision.rationale,
         assignmentQueue: distributionDecision.target?.id ?? null,
+        handoffRole: handoffDecision.nextRole ?? null,
       },
     },
   });
@@ -1197,6 +1741,7 @@ const runLeadAgentWorkflow = async (input: {
     decision: {
       ...decision,
       assignmentQueue: distributionDecision.target?.id ?? null,
+      handoffRole: handoffDecision.nextRole ?? null,
     },
     runId: run.id,
   };
@@ -1698,6 +2243,135 @@ api.put('/v1/agent/strategies', async (c) => {
   return c.json({ strategies: { optimization, distribution } });
 });
 
+api.get('/v1/agent/handoffs', async (c) => {
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const config = normalizeAgentHandoffConfig(settings.agentHandoffs);
+
+  return c.json({ config });
+});
+
+api.put('/v1/agent/handoffs', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const config = normalizeAgentHandoffConfig(body.config ?? body);
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  await prisma.organization.update({
+    where: { id: c.get('tenantId') },
+    data: {
+      settings: {
+        ...settings,
+        agentHandoffs: config,
+      },
+    },
+  });
+
+  return c.json({ config });
+});
+
+api.post('/v1/agent/handoffs/preview', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const leadId = typeof body.leadId === 'string' ? body.leadId : null;
+  const stage = typeof body.stage === 'string' ? body.stage : 'new';
+  const score = typeof body.score === 'number' ? body.score : null;
+  const tags = Array.isArray(body.tags)
+    ? body.tags.filter((tag) => typeof tag === 'string')
+    : [];
+  const taskType = typeof body.taskType === 'string' ? body.taskType : null;
+  const confidence =
+    typeof body.confidence === 'number' && body.confidence >= 0 ? body.confidence : null;
+
+  const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const config = normalizeAgentHandoffConfig(settings.agentHandoffs);
+
+  let leadStage = stage;
+  let leadTags = tags;
+  let leadScore = score;
+  let leadMetadata: Record<string, unknown> | null = null;
+
+  if (leadId) {
+    const lead = await prisma.lead.findFirst({
+      where: { id: leadId, organizationId: c.get('tenantId') },
+    });
+    if (lead) {
+      leadStage = lead.stage;
+      leadTags = lead.tags;
+      leadScore = lead.score ?? null;
+      leadMetadata =
+        lead.metadata && typeof lead.metadata === 'object' && !Array.isArray(lead.metadata)
+          ? (lead.metadata as Record<string, unknown>)
+          : null;
+    }
+  }
+
+  const decision = evaluateHandoff({
+    config,
+    lead: {
+      id: leadId ?? 'preview',
+      stage: leadStage,
+      score: leadScore,
+      tags: leadTags,
+      source: null,
+      metadata: leadMetadata,
+    },
+    context: {
+      matchedRuleIds: Array.isArray(body.matchedRuleIds)
+        ? body.matchedRuleIds.filter((value) => typeof value === 'string')
+        : [],
+      taskType,
+      confidence,
+    },
+  });
+
+  const sharedContext = applyContextAllowlist(
+    {
+      lead: {
+        id: leadId ?? 'preview',
+        stage: leadStage,
+        score: leadScore,
+        tags: leadTags,
+        source: null,
+        metadata: leadMetadata ?? {},
+      },
+      context: {
+        matchedRuleIds: Array.isArray(body.matchedRuleIds)
+          ? body.matchedRuleIds.filter((value) => typeof value === 'string')
+          : [],
+        taskType,
+        confidence,
+      },
+    },
+    config.contextAllowlist
+  );
+
+  return c.json({
+    decision: {
+      nextRole: decision.nextRole,
+      trigger: decision.trigger,
+      sharedContext,
+    },
+  });
+});
+
+api.get('/v1/agent/handoffs/logs', async (c) => {
+  const leadId = c.req.query('leadId');
+  const limitRaw = c.req.query('limit');
+  const limit = Math.min(200, Math.max(1, Number(limitRaw ?? 50)));
+
+  const logs = await prisma.agentHandoffLog.findMany({
+    where: {
+      organizationId: c.get('tenantId'),
+      ...(leadId ? { leadId } : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    include: {
+      lead: { select: { id: true, stage: true } },
+    },
+  });
+
+  return c.json({ logs });
+});
+
 api.post('/v1/agent/distribution/preview', async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
   const leadId = typeof body.leadId === 'string' ? body.leadId : null;
@@ -1800,6 +2474,7 @@ api.get('/v1/knowledge-sources', async (c) => {
     orderBy: { createdAt: 'desc' },
     include: {
       _count: { select: { chunks: true } },
+      syncs: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
   });
 
@@ -1810,7 +2485,11 @@ api.post('/v1/knowledge-sources', async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const description = typeof body.description === 'string' ? body.description.trim() : null;
-  const kind = typeof body.kind === 'string' && body.kind.trim().length > 0 ? body.kind.trim() : 'text';
+  const kindRaw = typeof body.kind === 'string' ? body.kind.trim() : '';
+  const normalizedKind = kindRaw === 'text' ? 'manual' : kindRaw;
+  const kind = ['manual', 'web', 'notion', 'google_docs'].includes(normalizedKind)
+    ? normalizedKind
+    : 'manual';
   const config =
     body.config && typeof body.config === 'object' && !Array.isArray(body.config)
       ? (body.config as Record<string, unknown>)
@@ -1831,6 +2510,53 @@ api.post('/v1/knowledge-sources', async (c) => {
   });
 
   return c.json({ source });
+});
+
+api.put('/v1/knowledge-sources/:id', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const source = await prisma.knowledgeSource.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!source) {
+    return c.json({ error: 'source_not_found' }, 404);
+  }
+
+  const updates: Prisma.KnowledgeSourceUpdateInput = {};
+  if (typeof body.name === 'string') {
+    const name = body.name.trim();
+    if (!name) {
+      return c.json({ error: 'name_required' }, 400);
+    }
+    updates.name = name;
+  }
+  if (typeof body.description === 'string') {
+    updates.description = body.description.trim() || null;
+  } else if (body.description === null) {
+    updates.description = null;
+  }
+  if (typeof body.kind === 'string') {
+    const normalizedKind = body.kind.trim() === 'text' ? 'manual' : body.kind.trim();
+    if (!['manual', 'web', 'notion', 'google_docs'].includes(normalizedKind)) {
+      return c.json({ error: 'invalid_kind' }, 400);
+    }
+    updates.kind = normalizedKind;
+  }
+  if (typeof body.enabled === 'boolean') {
+    updates.enabled = body.enabled;
+  }
+  if (body.config === null) {
+    updates.config = null;
+  } else if (body.config && typeof body.config === 'object' && !Array.isArray(body.config)) {
+    updates.config = body.config as Record<string, unknown>;
+  }
+
+  const updated = await prisma.knowledgeSource.update({
+    where: { id: source.id },
+    data: updates,
+  });
+
+  return c.json({ source: updated });
 });
 
 api.post('/v1/knowledge-sources/:id/chunks', async (c) => {
@@ -1860,16 +2586,78 @@ api.post('/v1/knowledge-sources/:id/chunks', async (c) => {
     return c.json({ error: 'no_chunks' }, 400);
   }
 
-  await prisma.knowledgeChunk.createMany({
-    data: chunks.map((chunk, index) => ({
-      organizationId: c.get('tenantId'),
-      sourceId: source.id,
-      content: chunk,
-      metadata: metadata ? { ...metadata, chunkIndex: index } : { chunkIndex: index },
-    })),
-  });
+  const chunkRows = chunks.map((chunk, index) => ({
+    id: crypto.randomUUID(),
+    organizationId: c.get('tenantId'),
+    sourceId: source.id,
+    content: chunk,
+    metadata: metadata ? { ...metadata, chunkIndex: index } : { chunkIndex: index },
+  }));
+
+  await prisma.knowledgeChunk.createMany({ data: chunkRows });
+  await Promise.all(
+    chunkRows.map((row) =>
+      knowledgeQueue.add(
+        'embed-chunk',
+        { type: 'embed-chunk', chunkId: row.id },
+        defaultJobOptions
+      )
+    )
+  );
 
   return c.json({ created: chunks.length });
+});
+
+api.post('/v1/knowledge-sources/:id/sync', async (c) => {
+  const source = await prisma.knowledgeSource.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!source) {
+    return c.json({ error: 'source_not_found' }, 404);
+  }
+
+  if (!['web', 'notion', 'google_docs'].includes(source.kind)) {
+    return c.json({ error: 'source_not_syncable' }, 400);
+  }
+
+  const sync = await prisma.knowledgeSync.create({
+    data: {
+      organizationId: c.get('tenantId'),
+      sourceId: source.id,
+      status: 'pending',
+      metadata: { trigger: 'manual' },
+    },
+  });
+
+  await knowledgeQueue.add(
+    'sync-source',
+    { type: 'sync-source', syncId: sync.id },
+    defaultJobOptions
+  );
+
+  return c.json({ sync });
+});
+
+api.get('/v1/knowledge-sources/:id/syncs', async (c) => {
+  const source = await prisma.knowledgeSource.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!source) {
+    return c.json({ error: 'source_not_found' }, 404);
+  }
+
+  const limit =
+    typeof c.req.query('limit') === 'string' ? Number(c.req.query('limit')) : 20;
+  const take = Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.floor(limit))) : 20;
+  const syncs = await prisma.knowledgeSync.findMany({
+    where: { sourceId: source.id },
+    orderBy: { createdAt: 'desc' },
+    take,
+  });
+
+  return c.json({ syncs });
 });
 
 api.post('/v1/knowledge/retrieve', async (c) => {
@@ -1879,6 +2667,21 @@ api.post('/v1/knowledge/retrieve', async (c) => {
   const sourceIds = Array.isArray(body.sourceIds)
     ? body.sourceIds.filter((id) => typeof id === 'string')
     : undefined;
+  const tags = Array.isArray(body.tags)
+    ? body.tags.filter((tag) => typeof tag === 'string' && tag.trim().length > 0)
+    : undefined;
+  const recentDays =
+    typeof body.recentDays === 'number' && body.recentDays > 0 ? body.recentDays : null;
+  const since =
+    typeof body.since === 'string' && body.since.trim().length > 0
+      ? new Date(body.since)
+      : null;
+  const minCreatedAt =
+    since && !Number.isNaN(since.getTime())
+      ? since
+      : recentDays
+        ? new Date(Date.now() - recentDays * 24 * 60 * 60 * 1000)
+        : null;
 
   if (!query.trim()) {
     return c.json({ error: 'query_required' }, 400);
@@ -1889,6 +2692,8 @@ api.post('/v1/knowledge/retrieve', async (c) => {
     query,
     topK,
     sourceIds,
+    tags,
+    minCreatedAt,
   });
 
   return c.json({ results });
@@ -3262,6 +4067,9 @@ api.post('/v1/leads/:id/signals', async (c) => {
   const signals = normalizeTags(body.signals);
   const text = typeof body.text === 'string' ? body.text : undefined;
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const taskType = typeof body.taskType === 'string' ? body.taskType : undefined;
+  const confidence =
+    typeof body.confidence === 'number' && body.confidence >= 0 ? body.confidence : undefined;
 
   if (signals.length === 0 && !text) {
     return c.json({ error: 'invalid_payload' }, 400);
@@ -3316,6 +4124,11 @@ api.post('/v1/leads/:id/signals', async (c) => {
     text,
     signals,
     sessionId,
+    matchedRuleIds: ruleResult?.matchedRules
+      ?.map((rule) => rule.id ?? rule.name ?? '')
+      .filter((value) => value.length > 0),
+    taskType,
+    confidence,
   });
 
   if (agentResult.lead) {
@@ -3368,6 +4181,9 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
   const signals = normalizeTags(body.signals);
   const text = typeof body.text === 'string' ? body.text : undefined;
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
+  const taskType = typeof body.taskType === 'string' ? body.taskType : undefined;
+  const confidence =
+    typeof body.confidence === 'number' && body.confidence >= 0 ? body.confidence : undefined;
 
   if (signals.length === 0 && !text) {
     return c.json({ error: 'invalid_payload' }, 400);
@@ -3387,6 +4203,11 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
     text,
     signals,
     sessionId,
+    matchedRuleIds: Array.isArray(body.matchedRuleIds)
+      ? body.matchedRuleIds.filter((value) => typeof value === 'string')
+      : undefined,
+    taskType,
+    confidence,
   });
 
   if (!agentResult.lead) {

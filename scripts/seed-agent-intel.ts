@@ -70,7 +70,7 @@ const ensureKnowledgeSource = async (organizationId: string) => {
       organizationId,
       name: 'Pricing FAQ',
       description: 'Seeded FAQ content for pricing and plans.',
-      kind: 'text',
+      kind: 'manual',
       config: { seed: true },
     },
   });

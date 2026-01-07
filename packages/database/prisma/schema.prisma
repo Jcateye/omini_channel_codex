@@ -117,6 +117,20 @@ enum CampaignOptimizationStatus {
   dismissed
 }
 
+enum KnowledgeSourceType {
+  manual
+  web
+  notion
+  google_docs
+}
+
+enum KnowledgeSyncStatus {
+  pending
+  running
+  completed
+  failed
+}
+
 model Organization {
   id        String   @id @default(uuid())
   name      String
@@ -150,6 +164,8 @@ model Organization {
   agentRuns          AgentRun[]
   campaignOptimizations CampaignOptimization[]
   leadAssignmentLogs LeadAssignmentLog[]
+  agentHandoffLogs AgentHandoffLog[]
+  knowledgeSyncs     KnowledgeSync[]
 }
 
 model ApiKey {
@@ -308,6 +324,7 @@ model Lead {
   agentMemories AgentMemory[]
   agentRuns     AgentRun[]
   assignmentLogs LeadAssignmentLog[]
+  handoffLogs   AgentHandoffLog[]
 
   @@index([organizationId])
   @@index([contactId])
@@ -607,7 +624,7 @@ model KnowledgeSource {
   organizationId String
   name           String
   description    String?
-  kind           String
+  kind           KnowledgeSourceType
   config         Json?
   enabled        Boolean  @default(true)
   createdAt      DateTime @default(now())
@@ -615,6 +632,7 @@ model KnowledgeSource {
 
   organization Organization  @relation(fields: [organizationId], references: [id])
   chunks       KnowledgeChunk[]
+  syncs        KnowledgeSync[]
 
   @@index([organizationId])
 }
@@ -625,6 +643,7 @@ model KnowledgeChunk {
   sourceId       String
   content        String
   metadata       Json?
+  vectorId       String?
   createdAt      DateTime @default(now())
 
   organization Organization   @relation(fields: [organizationId], references: [id])
@@ -632,6 +651,7 @@ model KnowledgeChunk {
 
   @@index([organizationId])
   @@index([sourceId])
+  @@index([vectorId])
 }
 
 model AgentRun {
@@ -712,4 +732,44 @@ model LeadAssignmentLog {
   @@index([organizationId])
   @@index([leadId])
   @@index([strategy])
+}
+
+model AgentHandoffLog {
+  id             String   @id @default(uuid())
+  organizationId String
+  leadId         String
+  fromRole       String?
+  toRole         String
+  triggerType    String
+  triggerRuleId  String?
+  triggerDetail  Json?
+  contextShared  Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead         @relation(fields: [leadId], references: [id])
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([toRole])
+}
+
+model KnowledgeSync {
+  id             String            @id @default(uuid())
+  organizationId String
+  sourceId       String
+  status         KnowledgeSyncStatus @default(pending)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  errorMessage   String?
+  metadata       Json?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  source       KnowledgeSource @relation(fields: [sourceId], references: [id])
+
+  @@index([organizationId])
+  @@index([sourceId])
+  @@index([status])
 }

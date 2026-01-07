@@ -6,6 +6,10 @@ import { registerAgentRepliesWorker } from './handlers/agent-replies.js';
 import { registerOutboundMessagesWorker } from './handlers/outbound-messages.js';
 import { registerStatusEventsWorker } from './handlers/status-events.js';
 import { registerAnalyticsMetricsWorker, startAnalyticsScheduler } from './handlers/analytics-metrics.js';
+import {
+  registerKnowledgeSyncWorker,
+  startKnowledgeSyncScheduler,
+} from './handlers/knowledge-sync.js';
 
 const inboundWorker = registerInboundEventsWorker();
 const agentRepliesWorker = registerAgentRepliesWorker();
@@ -16,6 +20,8 @@ const campaignWorker = registerCampaignSendsWorker();
 const campaignScheduler = startCampaignScheduler();
 const analyticsWorker = registerAnalyticsMetricsWorker();
 const analyticsScheduler = startAnalyticsScheduler();
+const knowledgeWorker = registerKnowledgeSyncWorker();
+const knowledgeScheduler = startKnowledgeSyncScheduler();
 
 inboundWorker.getBullWorker()?.on('completed', (job) => {
   console.log(`Inbound job ${job.id} completed`);
@@ -65,6 +71,14 @@ analyticsWorker.getBullWorker()?.on('failed', (job, err) => {
   console.error(`Analytics job ${job?.id ?? 'unknown'} failed`, err);
 });
 
+knowledgeWorker.getBullWorker()?.on('completed', (job) => {
+  console.log(`Knowledge job ${job.id} completed`);
+});
+
+knowledgeWorker.getBullWorker()?.on('failed', (job, err) => {
+  console.error(`Knowledge job ${job?.id ?? 'unknown'} failed`, err);
+});
+
 campaignWorker.getBullWorker()?.on('completed', (job) => {
   console.log(`Campaign job ${job.id} completed`);
 });
@@ -75,5 +89,6 @@ campaignWorker.getBullWorker()?.on('failed', (job, err) => {
 
 console.log(`Campaign scheduler running every ${campaignScheduler.intervalMs}ms`);
 console.log(`Analytics scheduler running every ${analyticsScheduler.intervalMs}ms`);
+console.log(`Knowledge sync scheduler running every ${knowledgeScheduler.intervalMs}ms`);
 
 console.log('Worker listening for jobs');

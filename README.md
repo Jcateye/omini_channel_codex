@@ -21,7 +21,7 @@ TypeScript monorepo with API, worker, and console.
 ## Prerequisites
 - Node.js 20+
 - pnpm 9+
-- Docker (PostgreSQL + Redis)
+- Docker (PostgreSQL + Redis + Qdrant)
 
 ## Environment
 Copy `.env.example` to `.env` and adjust as needed.
@@ -34,6 +34,13 @@ Key variables:
 - `BOOTSTRAP_TOKEN`: Admin bootstrap endpoint token.
 - `CAMPAIGN_SCHEDULER_INTERVAL_MS`: Worker scheduler interval.
 - `ANALYTICS_SCHEDULER_INTERVAL_MS`: Worker analytics rollup interval.
+- `QDRANT_URL`: Qdrant endpoint for vector search.
+- `QDRANT_API_KEY`: Optional Qdrant API key.
+- `QDRANT_COLLECTION`: Qdrant collection name.
+- `OPENAI_API_KEY`: OpenAI key for embeddings.
+- `OPENAI_BASE_URL`: Optional OpenAI base URL override.
+- `OPENAI_EMBEDDING_MODEL`: Embedding model (default `text-embedding-3-small`).
+- `KNOWLEDGE_SYNC_POLL_MS`: RAG connector scheduler interval.
 
 ## Local Setup
 ```bash
@@ -83,6 +90,7 @@ pnpm tsx scripts/mock-flow.ts
 - API: `3100` (set with `PORT`)
 - Postgres: `5433` (docker-compose)
 - Redis: `6380` (docker-compose)
+- Qdrant: `6333` (docker-compose)
 
 ## Notes
 - Full API surface is implemented in `services/api/src/index.ts`.

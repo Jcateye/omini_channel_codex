@@ -20,8 +20,10 @@ type KnowledgeSource = {
   name: string;
   description?: string | null;
   kind: string;
+  config?: Record<string, unknown> | null;
   enabled: boolean;
   _count?: { chunks: number };
+  syncs?: KnowledgeSync[];
   createdAt: string;
 };
 
@@ -30,6 +32,16 @@ type KnowledgeChunk = {
   sourceId: string;
   content: string;
   score?: number;
+};
+
+type KnowledgeSync = {
+  id: string;
+  status: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+  metadata?: Record<string, unknown> | null;
 };
 
 type Optimization = {
@@ -62,6 +74,19 @@ type AssignmentLog = {
   lead?: { id: string; stage: string } | null;
 };
 
+type HandoffLog = {
+  id: string;
+  leadId: string;
+  fromRole?: string | null;
+  toRole: string;
+  triggerType: string;
+  triggerRuleId?: string | null;
+  triggerDetail?: Record<string, unknown> | null;
+  contextShared?: Record<string, unknown> | null;
+  createdAt: string;
+  lead?: { id: string; stage: string } | null;
+};
+
 const safeJson = (value: string) => {
   try {
     return { ok: true, data: JSON.parse(value) } as const;
@@ -79,8 +104,15 @@ export default function AgentIntelPage() {
   const [sourcesError, setSourcesError] = useState('');
   const [sourceName, setSourceName] = useState('');
   const [sourceDescription, setSourceDescription] = useState('');
-  const [sourceKind, setSourceKind] = useState('text');
+  const [sourceKind, setSourceKind] = useState('manual');
+  const [sourceConfigText, setSourceConfigText] = useState('');
   const [selectedSourceId, setSelectedSourceId] = useState('');
+  const [selectedConfigText, setSelectedConfigText] = useState('');
+  const [sourceEditStatus, setSourceEditStatus] = useState('');
+  const [sourceEditError, setSourceEditError] = useState('');
+  const [syncs, setSyncs] = useState<KnowledgeSync[]>([]);
+  const [syncStatus, setSyncStatus] = useState('');
+  const [syncError, setSyncError] = useState('');
 
   const [chunkContent, setChunkContent] = useState('');
   const [chunkSize, setChunkSize] = useState('600');
@@ -113,6 +145,22 @@ export default function AgentIntelPage() {
   const [assignmentStatus, setAssignmentStatus] = useState('');
   const [assignmentError, setAssignmentError] = useState('');
 
+  const [handoffConfigText, setHandoffConfigText] = useState('');
+  const [handoffStatus, setHandoffStatus] = useState('');
+  const [handoffError, setHandoffError] = useState('');
+  const [handoffPreviewLeadId, setHandoffPreviewLeadId] = useState('');
+  const [handoffPreviewStage, setHandoffPreviewStage] = useState('qualified');
+  const [handoffPreviewScore, setHandoffPreviewScore] = useState('65');
+  const [handoffPreviewTags, setHandoffPreviewTags] = useState('high-intent,pricing');
+  const [handoffPreviewTask, setHandoffPreviewTask] = useState('support');
+  const [handoffPreviewConfidence, setHandoffPreviewConfidence] = useState('0.8');
+  const [handoffPreviewResult, setHandoffPreviewResult] = useState('');
+  const [handoffPreviewError, setHandoffPreviewError] = useState('');
+  const [handoffLogs, setHandoffLogs] = useState<HandoffLog[]>([]);
+  const [handoffLogFilterLeadId, setHandoffLogFilterLeadId] = useState('');
+  const [handoffLogsStatus, setHandoffLogsStatus] = useState('');
+  const [handoffLogsError, setHandoffLogsError] = useState('');
+
   useEffect(() => {
     const savedKey = window.localStorage.getItem(storageKeys.apiKey) ?? '';
     const savedBase = window.localStorage.getItem(storageKeys.apiBase) ?? '';
@@ -133,6 +181,19 @@ export default function AgentIntelPage() {
     if (!base) return '';
     return base.endsWith('/') ? base.slice(0, -1) : base;
   }, [apiBase]);
+
+  const selectedSource = useMemo(
+    () => sources.find((source) => source.id === selectedSourceId) ?? null,
+    [sources, selectedSourceId]
+  );
+
+  useEffect(() => {
+    if (!selectedSource) {
+      setSelectedConfigText('');
+      return;
+    }
+    setSelectedConfigText(JSON.stringify(selectedSource.config ?? {}, null, 2));
+  }, [selectedSource]);
 
   const apiFetch = async <T,>(path: string, options?: RequestInit): Promise<T> => {
     if (!apiKey) {
@@ -249,6 +310,83 @@ export default function AgentIntelPage() {
     }
   };
 
+  const loadHandoffConfig = async () => {
+    setHandoffStatus('');
+    setHandoffError('');
+    try {
+      const data = await apiFetch<{ config: Record<string, unknown> }>('/v1/agent/handoffs');
+      setHandoffConfigText(JSON.stringify(data.config ?? {}, null, 2));
+      setHandoffStatus('Handoff config loaded.');
+    } catch (error) {
+      setHandoffError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const saveHandoffConfig = async () => {
+    setHandoffStatus('');
+    setHandoffError('');
+    const parsed = safeJson(handoffConfigText);
+    if (!parsed.ok) {
+      setHandoffError('Handoff config JSON is invalid.');
+      return;
+    }
+
+    try {
+      await apiFetch('/v1/agent/handoffs', {
+        method: 'PUT',
+        body: JSON.stringify({ config: parsed.data }),
+      });
+      setHandoffStatus('Handoff config saved.');
+    } catch (error) {
+      setHandoffError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const previewHandoff = async () => {
+    setHandoffPreviewError('');
+    setHandoffPreviewResult('');
+    try {
+      const data = await apiFetch<{ decision: Record<string, unknown> }>(
+        '/v1/agent/handoffs/preview',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            leadId: handoffPreviewLeadId.trim() || undefined,
+            stage: handoffPreviewStage.trim() || undefined,
+            score: Number(handoffPreviewScore),
+            tags: handoffPreviewTags
+              .split(',')
+              .map((tag) => tag.trim())
+              .filter((tag) => tag.length > 0),
+            taskType: handoffPreviewTask.trim() || undefined,
+            confidence: Number(handoffPreviewConfidence),
+          }),
+        }
+      );
+      setHandoffPreviewResult(JSON.stringify(data.decision ?? {}, null, 2));
+    } catch (error) {
+      setHandoffPreviewError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const loadHandoffLogs = async () => {
+    setHandoffLogsStatus('');
+    setHandoffLogsError('');
+    try {
+      const params = new URLSearchParams();
+      if (handoffLogFilterLeadId.trim()) {
+        params.set('leadId', handoffLogFilterLeadId.trim());
+      }
+      const data = await apiFetch<{ logs: HandoffLog[] }>(
+        `/v1/agent/handoffs/logs${params.toString() ? `?${params.toString()}` : ''}`
+      );
+      setHandoffLogs(data.logs ?? []);
+      setHandoffLogsStatus('Handoff logs loaded.');
+    } catch (error) {
+      setHandoffLogsError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   const loadSources = async () => {
     setSourcesStatus('');
     setSourcesError('');
@@ -272,6 +410,15 @@ export default function AgentIntelPage() {
       setSourcesError('Provide a source name.');
       return;
     }
+    let configPayload: Record<string, unknown> | null = null;
+    if (sourceConfigText.trim()) {
+      const parsed = safeJson(sourceConfigText);
+      if (!parsed.ok) {
+        setSourcesError('Source config JSON is invalid.');
+        return;
+      }
+      configPayload = parsed.data as Record<string, unknown>;
+    }
 
     try {
       const data = await apiFetch<{ source: KnowledgeSource }>('/v1/knowledge-sources', {
@@ -279,16 +426,87 @@ export default function AgentIntelPage() {
         body: JSON.stringify({
           name,
           description: sourceDescription.trim() || undefined,
-          kind: sourceKind.trim() || 'text',
+          kind: sourceKind.trim() || 'manual',
+          config: configPayload ?? undefined,
         }),
       });
       setSources((prev) => [data.source, ...prev]);
       setSelectedSourceId(data.source.id);
       setSourceName('');
       setSourceDescription('');
+      setSourceConfigText('');
       setSourcesStatus('Source created.');
     } catch (error) {
       setSourcesError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const saveSelectedSource = async () => {
+    setSourceEditStatus('');
+    setSourceEditError('');
+    if (!selectedSourceId) {
+      setSourceEditError('Select a source to update.');
+      return;
+    }
+    let configPayload: Record<string, unknown> | null = null;
+    if (selectedConfigText.trim()) {
+      const parsed = safeJson(selectedConfigText);
+      if (!parsed.ok) {
+        setSourceEditError('Selected config JSON is invalid.');
+        return;
+      }
+      configPayload = parsed.data as Record<string, unknown>;
+    }
+
+    try {
+      const data = await apiFetch<{ source: KnowledgeSource }>(
+        `/v1/knowledge-sources/${selectedSourceId}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ config: configPayload }),
+        }
+      );
+      setSources((prev) => prev.map((source) => (source.id === data.source.id ? data.source : source)));
+      setSourceEditStatus('Source updated.');
+    } catch (error) {
+      setSourceEditError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const triggerSync = async () => {
+    setSyncStatus('');
+    setSyncError('');
+    if (!selectedSourceId) {
+      setSyncError('Select a source to sync.');
+      return;
+    }
+    try {
+      const data = await apiFetch<{ sync: KnowledgeSync }>(
+        `/v1/knowledge-sources/${selectedSourceId}/sync`,
+        { method: 'POST' }
+      );
+      setSyncs((prev) => [data.sync, ...prev]);
+      setSyncStatus('Sync queued.');
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const loadSyncs = async () => {
+    setSyncStatus('');
+    setSyncError('');
+    if (!selectedSourceId) {
+      setSyncError('Select a source to load syncs.');
+      return;
+    }
+    try {
+      const data = await apiFetch<{ syncs: KnowledgeSync[] }>(
+        `/v1/knowledge-sources/${selectedSourceId}/syncs`
+      );
+      setSyncs(data.syncs ?? []);
+      setSyncStatus('Sync history loaded.');
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -470,11 +688,16 @@ export default function AgentIntelPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>Kind</Label>
-                  <Input
+                  <select
                     value={sourceKind}
                     onChange={(event) => setSourceKind(event.target.value)}
-                    placeholder="text"
-                  />
+                    className="flex h-10 w-full rounded-md border border-ink/10 bg-surface/80 px-3 py-2 text-sm text-ink shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                  >
+                    <option value="manual">manual</option>
+                    <option value="web">web</option>
+                    <option value="notion">notion</option>
+                    <option value="google_docs">google_docs</option>
+                  </select>
                 </div>
                 <div className="space-y-2 sm:col-span-2">
                   <Label>Description</Label>
@@ -482,6 +705,15 @@ export default function AgentIntelPage() {
                     value={sourceDescription}
                     onChange={(event) => setSourceDescription(event.target.value)}
                     placeholder="Short summary"
+                  />
+                </div>
+                <div className="space-y-2 sm:col-span-2">
+                  <Label>Config (JSON)</Label>
+                  <Textarea
+                    value={sourceConfigText}
+                    onChange={(event) => setSourceConfigText(event.target.value)}
+                    placeholder='{"url":"https://example.com","crawlDepth":1,"maxPages":5,"syncIntervalMinutes":60}'
+                    className="min-h-[120px]"
                   />
                 </div>
               </div>
@@ -492,24 +724,30 @@ export default function AgentIntelPage() {
                 {sources.length === 0 ? (
                   <p className="text-sm text-muted">No knowledge sources yet.</p>
                 ) : null}
-                {sources.map((source) => (
-                  <button
-                    key={source.id}
-                    type="button"
-                    onClick={() => setSelectedSourceId(source.id)}
-                    className={`flex w-full flex-col gap-1 rounded-xl border border-ink/10 p-4 text-left transition ${
-                      selectedSourceId === source.id ? 'bg-white/80 ring-1 ring-accent/40' : 'bg-white/60'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-semibold">{source.name}</span>
-                      <Badge variant="muted">{source._count?.chunks ?? 0} chunks</Badge>
-                    </div>
-                    <div className="text-xs text-muted">
-                      {source.kind} · {source.description || 'No description'}
-                    </div>
-                  </button>
-                ))}
+                {sources.map((source) => {
+                  const latestSync = source.syncs?.[0];
+                  return (
+                    <button
+                      key={source.id}
+                      type="button"
+                      onClick={() => setSelectedSourceId(source.id)}
+                      className={`flex w-full flex-col gap-1 rounded-xl border border-ink/10 p-4 text-left transition ${
+                        selectedSourceId === source.id
+                          ? 'bg-white/80 ring-1 ring-accent/40'
+                          : 'bg-white/60'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold">{source.name}</span>
+                        <Badge variant="muted">{source._count?.chunks ?? 0} chunks</Badge>
+                      </div>
+                      <div className="text-xs text-muted">
+                        {source.kind} · {source.description || 'No description'}
+                        {latestSync ? ` · sync ${latestSync.status}` : ''}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </Card>
@@ -543,6 +781,89 @@ export default function AgentIntelPage() {
                 <Button onClick={addChunks}>Index content</Button>
                 {chunkStatus ? <span className="text-xs text-accent">{chunkStatus}</span> : null}
                 {chunkError ? <span className="text-xs text-accent2">{chunkError}</span> : null}
+              </div>
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6">
+          <Card className="animate-rise">
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Source sync</CardTitle>
+                <CardDescription>Update connector config and trigger sync runs.</CardDescription>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>Selected source</Label>
+                  <Input
+                    value={selectedSource?.name ? `${selectedSource.name} (${selectedSource.kind})` : 'Select a source'}
+                    readOnly
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Source ID</Label>
+                  <Input value={selectedSourceId || 'Select a source'} readOnly />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label>Selected config (JSON)</Label>
+                <Textarea
+                  value={selectedConfigText}
+                  onChange={(event) => setSelectedConfigText(event.target.value)}
+                  placeholder="{}"
+                  className="min-h-[160px]"
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button variant="outline" onClick={saveSelectedSource}>
+                  Save config
+                </Button>
+                <Button variant="outline" onClick={triggerSync}>
+                  Sync now
+                </Button>
+                <Button variant="outline" onClick={loadSyncs}>
+                  Load syncs
+                </Button>
+              </div>
+              {(sourceEditStatus || sourceEditError || syncStatus || syncError) && (
+                <div className="flex flex-wrap gap-3 text-xs">
+                  {sourceEditStatus ? (
+                    <span className="text-accent">{sourceEditStatus}</span>
+                  ) : null}
+                  {sourceEditError ? (
+                    <span className="text-accent2">{sourceEditError}</span>
+                  ) : null}
+                  {syncStatus ? <span className="text-accent">{syncStatus}</span> : null}
+                  {syncError ? <span className="text-accent2">{syncError}</span> : null}
+                </div>
+              )}
+              <div className="space-y-3">
+                {syncs.length === 0 ? (
+                  <p className="text-sm text-muted">No sync runs yet.</p>
+                ) : null}
+                {syncs.map((sync) => (
+                  <div
+                    key={sync.id}
+                    className="rounded-xl border border-ink/10 bg-white/70 p-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold">{sync.status}</p>
+                        <p className="text-xs text-muted">
+                          {sync.startedAt || sync.createdAt}
+                          {sync.completedAt ? ` → ${sync.completedAt}` : ''}
+                        </p>
+                      </div>
+                      <Badge variant={sync.status === 'failed' ? 'accent' : 'muted'}>
+                        {sync.status}
+                      </Badge>
+                    </div>
+                    {sync.errorMessage ? (
+                      <p className="mt-2 text-xs text-accent2">{sync.errorMessage}</p>
+                    ) : null}
+                  </div>
+                ))}
               </div>
             </div>
           </Card>
@@ -761,6 +1082,153 @@ export default function AgentIntelPage() {
                     {log.rationale ? (
                       <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
                         {JSON.stringify(log.rationale ?? {}, null, 2)}
+                      </pre>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+          <Card className="animate-rise">
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Handoff config</CardTitle>
+                <CardDescription>Stage-based role handoff rules.</CardDescription>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button variant="outline" onClick={loadHandoffConfig}>
+                  Load handoffs
+                </Button>
+                <Button variant="warm" onClick={saveHandoffConfig}>
+                  Save handoffs
+                </Button>
+                {handoffStatus ? <span className="text-xs text-accent">{handoffStatus}</span> : null}
+                {handoffError ? <span className="text-xs text-accent2">{handoffError}</span> : null}
+              </div>
+              <Textarea
+                value={handoffConfigText}
+                onChange={(event) => setHandoffConfigText(event.target.value)}
+                className="min-h-[240px] font-mono text-xs"
+              />
+            </div>
+          </Card>
+
+          <Card className="animate-rise">
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Handoff preview</CardTitle>
+                <CardDescription>Preview role transitions.</CardDescription>
+              </div>
+              <div className="space-y-2">
+                <Label>Lead id (optional)</Label>
+                <Input
+                  value={handoffPreviewLeadId}
+                  onChange={(event) => setHandoffPreviewLeadId(event.target.value)}
+                  placeholder="lead_id"
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>Stage</Label>
+                  <Input
+                    value={handoffPreviewStage}
+                    onChange={(event) => setHandoffPreviewStage(event.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Score</Label>
+                  <Input
+                    value={handoffPreviewScore}
+                    onChange={(event) => setHandoffPreviewScore(event.target.value)}
+                  />
+                </div>
+                <div className="space-y-2 sm:col-span-2">
+                  <Label>Tags (comma separated)</Label>
+                  <Input
+                    value={handoffPreviewTags}
+                    onChange={(event) => setHandoffPreviewTags(event.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Task type</Label>
+                  <Input
+                    value={handoffPreviewTask}
+                    onChange={(event) => setHandoffPreviewTask(event.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Confidence</Label>
+                  <Input
+                    value={handoffPreviewConfidence}
+                    onChange={(event) => setHandoffPreviewConfidence(event.target.value)}
+                  />
+                </div>
+              </div>
+              <Button variant="outline" onClick={previewHandoff}>
+                Preview handoff
+              </Button>
+              {handoffPreviewError ? (
+                <span className="text-xs text-accent2">{handoffPreviewError}</span>
+              ) : null}
+              <pre className="min-h-[160px] whitespace-pre-wrap rounded-xl border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
+                {handoffPreviewResult || 'No preview yet.'}
+              </pre>
+            </div>
+          </Card>
+        </section>
+
+        <section className="grid gap-6">
+          <Card className="animate-rise">
+            <div className="flex flex-col gap-5">
+              <div className="space-y-1">
+                <CardTitle>Handoff logs</CardTitle>
+                <CardDescription>Audit role transitions.</CardDescription>
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Input
+                  placeholder="filter by lead id"
+                  value={handoffLogFilterLeadId}
+                  onChange={(event) => setHandoffLogFilterLeadId(event.target.value)}
+                />
+                <Button variant="outline" onClick={loadHandoffLogs}>
+                  Load logs
+                </Button>
+                {handoffLogsStatus ? (
+                  <span className="text-xs text-accent">{handoffLogsStatus}</span>
+                ) : null}
+                {handoffLogsError ? (
+                  <span className="text-xs text-accent2">{handoffLogsError}</span>
+                ) : null}
+              </div>
+              <div className="space-y-3">
+                {handoffLogs.length === 0 ? (
+                  <p className="text-sm text-muted">No handoff logs yet.</p>
+                ) : null}
+                {handoffLogs.map((log) => (
+                  <div
+                    key={log.id}
+                    className="rounded-xl border border-ink/10 bg-white/70 p-4"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold">
+                          {log.fromRole ?? 'none'} → {log.toRole}
+                        </p>
+                        <p className="text-xs text-muted">Lead: {log.leadId}</p>
+                      </div>
+                      <Badge variant="muted">{log.triggerType}</Badge>
+                    </div>
+                    {log.triggerDetail ? (
+                      <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
+                        {JSON.stringify(log.triggerDetail ?? {}, null, 2)}
+                      </pre>
+                    ) : null}
+                    {log.contextShared ? (
+                      <pre className="mt-2 whitespace-pre-wrap rounded-lg border border-ink/10 bg-ink/[0.03] p-3 text-xs text-muted">
+                        {JSON.stringify(log.contextShared ?? {}, null, 2)}
                       </pre>
                     ) : null}
                   </div>
