@@ -22,6 +22,21 @@ const resolveRecipient = (
   return null;
 };
 
+const mergeCancelPayload = (rawPayload: unknown) => {
+  const base =
+    rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+      ? (rawPayload as Record<string, unknown>)
+      : {};
+
+  return {
+    ...base,
+    cancel: {
+      reason: 'campaign_canceled',
+      at: new Date().toISOString(),
+    },
+  };
+};
+
 export const registerOutboundMessagesWorker = () =>
   createWorker<OutboundMessageJob>(QUEUE_NAMES.outboundMessages, async (job) => {
     if (!job.data?.messageId) {
@@ -44,6 +59,10 @@ export const registerOutboundMessagesWorker = () =>
       return;
     }
 
+    if (message.status !== 'pending') {
+      return;
+    }
+
     if (message.channel.platform !== 'whatsapp') {
       return;
     }
@@ -56,6 +75,42 @@ export const registerOutboundMessagesWorker = () =>
     const adapter = getWhatsAppAdapter(provider);
     if (!adapter?.sendText) {
       throw new Error(`Unsupported WhatsApp provider: ${message.channel.provider}`);
+    }
+
+    const campaignSend = await prisma.campaignSend.findFirst({
+      where: { messageId: message.id },
+      include: {
+        campaign: { select: { id: true, status: true } },
+      },
+    });
+
+    if (campaignSend?.campaign?.status === 'canceled') {
+      await prisma.$transaction(async (tx) => {
+        const updated = await tx.campaignSend.updateMany({
+          where: { id: campaignSend.id, status: 'queued' },
+          data: {
+            status: 'skipped',
+            errorMessage: 'campaign_canceled',
+          },
+        });
+
+        if (updated.count > 0) {
+          await tx.campaign.update({
+            where: { id: campaignSend.campaignId },
+            data: { totalSkipped: { increment: 1 } },
+          });
+        }
+
+        await tx.message.updateMany({
+          where: { id: message.id, status: 'pending' },
+          data: {
+            status: 'failed',
+            rawPayload: mergeCancelPayload(message.rawPayload),
+          },
+        });
+      });
+
+      return;
     }
 
     const content =
@@ -106,10 +161,6 @@ export const registerOutboundMessagesWorker = () =>
             response: result.rawResponse ?? null,
           },
         },
-      });
-
-      const campaignSend = await prisma.campaignSend.findFirst({
-        where: { messageId: message.id },
       });
 
       if (campaignSend) {

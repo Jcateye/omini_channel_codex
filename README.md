@@ -41,6 +41,10 @@ Key variables:
 - `OPENAI_BASE_URL`: Optional OpenAI base URL override.
 - `OPENAI_EMBEDDING_MODEL`: Embedding model (default `text-embedding-3-small`).
 - `KNOWLEDGE_SYNC_POLL_MS`: RAG connector scheduler interval.
+- `WEBHOOK_SIGNING_SECRET`: Optional HMAC secret for live webhooks.
+- `WEBHOOK_SIGNATURE_TTL_MS`: Optional webhook signature TTL (ms).
+- `WEBHOOK_SIGNATURE_REQUIRED`: Require signatures for live webhooks (default `false`).
+- `CRM_TOOL_API_KEY`: Example external tool API key (used by HTTP tool adapter).
 
 ## Local Setup
 ```bash

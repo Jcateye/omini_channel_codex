@@ -72,6 +72,15 @@ type CampaignMetric = {
   roi?: number | null;
 };
 
+type AttributionReport = {
+  model: string;
+  range: { start: string; end: string };
+  totalWeight: number;
+  channels: Array<{ channel: ChannelMetric['channel']; weight: number }>;
+  campaigns: Array<{ campaign: CampaignMetric['campaign']; weight: number }>;
+  journeys: Array<{ journey: { id: string; name: string; status?: string | null } | null; weight: number }>;
+};
+
 type RealtimeResponse = {
   windowMinutes: number;
   range: { start: string; end: string };
@@ -129,6 +138,10 @@ export default function AnalyticsPage() {
   const [summary, setSummary] = useState<SummaryResponse | null>(null);
   const [channels, setChannels] = useState<ChannelMetric[]>([]);
   const [campaigns, setCampaigns] = useState<CampaignMetric[]>([]);
+  const [attributionReport, setAttributionReport] = useState<AttributionReport | null>(null);
+  const [attributionModel, setAttributionModel] = useState<'last_touch' | 'first_touch' | 'linear'>(
+    'last_touch'
+  );
   const [realtime, setRealtime] = useState<RealtimeResponse | null>(null);
   const [settings, setSettings] = useState<AnalyticsSettings>({
     attributionLookbackDays: 7,
@@ -143,6 +156,7 @@ export default function AnalyticsPage() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [attributionError, setAttributionError] = useState('');
 
   useEffect(() => {
     const savedKey = window.localStorage.getItem(storageKeys.apiKey) ?? '';
@@ -253,19 +267,23 @@ export default function AnalyticsPage() {
 
   const loadAnalytics = async () => {
     setError('');
+    setAttributionError('');
     setLoading(true);
 
     try {
       const query = buildQuery();
-      const [summaryData, channelData, campaignData] = await Promise.all([
+      const attributionQuery = query ? `${query}&model=${attributionModel}` : `?model=${attributionModel}`;
+      const [summaryData, channelData, campaignData, attributionData] = await Promise.all([
         apiFetch<SummaryResponse>(`/v1/analytics/summary${query}`),
         apiFetch<{ channels: ChannelMetric[] }>(`/v1/analytics/channels${query}`),
         apiFetch<{ campaigns: CampaignMetric[] }>(`/v1/analytics/campaigns${query}`),
+        apiFetch<AttributionReport>(`/v1/attribution/report${attributionQuery}`),
       ]);
 
       setSummary(summaryData);
       setChannels(channelData.channels ?? []);
       setCampaigns(campaignData.campaigns ?? []);
+      setAttributionReport(attributionData);
       const [trendChannelsData, trendCampaignsData] = await Promise.all([
         apiFetch<{ channels: TrendChannel[] }>(`/v1/analytics/trends/channels${query}`),
         apiFetch<{ campaigns: TrendCampaign[] }>(`/v1/analytics/trends/campaigns${query}`),
@@ -274,6 +292,7 @@ export default function AnalyticsPage() {
       setCampaignTrends(trendCampaignsData.campaigns ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setAttributionError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
@@ -293,7 +312,7 @@ export default function AnalyticsPage() {
             </Button>
           </div>
           <p className="max-w-2xl text-sm text-muted">
-            Track delivery, responses, conversions, and last-touch attribution.
+            Track delivery, responses, conversions, and compare attribution models.
           </p>
         </header>
 
@@ -480,6 +499,86 @@ export default function AnalyticsPage() {
             </div>
           </Card>
         </section>
+
+        <Card>
+          <div className="flex flex-col gap-4">
+            <div className="space-y-1">
+              <CardTitle>Multi-touch attribution</CardTitle>
+              <CardDescription>Compare model weights across channels, campaigns, and journeys.</CardDescription>
+            </div>
+            <div className="grid gap-4 lg:grid-cols-[220px_1fr]">
+              <div className="space-y-2">
+                <Label>Model</Label>
+                <select
+                  value={attributionModel}
+                  onChange={(event) =>
+                    setAttributionModel(
+                      event.target.value as 'last_touch' | 'first_touch' | 'linear'
+                    )
+                  }
+                  className="flex h-10 w-full rounded-md border border-ink/10 bg-surface/80 px-3 py-2 text-sm text-ink shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                >
+                  <option value="last_touch">last_touch</option>
+                  <option value="first_touch">first_touch</option>
+                  <option value="linear">linear</option>
+                </select>
+                <p className="text-xs text-muted">
+                  Total weight {attributionReport?.totalWeight?.toFixed(2) ?? '0.00'}
+                </p>
+                {attributionError ? (
+                  <p className="text-xs text-accent2">{attributionError}</p>
+                ) : null}
+              </div>
+              <div className="grid gap-4 md:grid-cols-3">
+                <div className="rounded-xl border border-ink/10 bg-white/70 p-4">
+                  <p className="text-sm font-semibold">Channels</p>
+                  {attributionReport?.channels?.length ? (
+                    <div className="mt-3 space-y-2 text-xs text-muted">
+                      {attributionReport.channels.map((row, index) => (
+                        <div key={row.channel?.id ?? `channel-${index}`} className="flex justify-between">
+                          <span>{row.channel?.name ?? row.channel?.id ?? 'Unknown'}</span>
+                          <span>{row.weight.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-muted">No channel touchpoints.</p>
+                  )}
+                </div>
+                <div className="rounded-xl border border-ink/10 bg-white/70 p-4">
+                  <p className="text-sm font-semibold">Campaigns</p>
+                  {attributionReport?.campaigns?.length ? (
+                    <div className="mt-3 space-y-2 text-xs text-muted">
+                      {attributionReport.campaigns.map((row, index) => (
+                        <div key={row.campaign?.id ?? `campaign-${index}`} className="flex justify-between">
+                          <span>{row.campaign?.name ?? row.campaign?.id ?? 'Unknown'}</span>
+                          <span>{row.weight.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-muted">No campaign touchpoints.</p>
+                  )}
+                </div>
+                <div className="rounded-xl border border-ink/10 bg-white/70 p-4">
+                  <p className="text-sm font-semibold">Journeys</p>
+                  {attributionReport?.journeys?.length ? (
+                    <div className="mt-3 space-y-2 text-xs text-muted">
+                      {attributionReport.journeys.map((row, index) => (
+                        <div key={row.journey?.id ?? `journey-${index}`} className="flex justify-between">
+                          <span>{row.journey?.name ?? row.journey?.id ?? 'Unknown'}</span>
+                          <span>{row.weight.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-muted">No journey touchpoints.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </Card>
 
         <section className="grid gap-6 lg:grid-cols-2">
           <Card>

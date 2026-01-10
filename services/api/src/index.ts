@@ -14,7 +14,7 @@ import {
   listExternalAdapters,
   registerExternalAdapter,
 } from '@omini/agent-tools';
-import { mockExternalAdapter } from '@omini/agent-tools';
+import { httpExternalAdapter, mockExternalAdapter } from '@omini/agent-tools';
 import { Langfuse } from 'langfuse';
 import { prisma } from '@omini/database';
 import { createQueue, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
@@ -35,18 +35,24 @@ const api = new Hono<ApiEnv>();
 const admin = new Hono();
 
 registerExternalAdapter(mockExternalAdapter);
+registerExternalAdapter(httpExternalAdapter);
 
 const inboundQueue = createQueue(QUEUE_NAMES.inboundEvents);
 const crmQueue = createQueue(QUEUE_NAMES.crmWebhooks);
 const outboundQueue = createQueue(QUEUE_NAMES.outboundMessages);
 const statusQueue = createQueue(QUEUE_NAMES.statusEvents);
 const knowledgeQueue = createQueue(QUEUE_NAMES.knowledgeSync);
+const journeyQueue = createQueue(QUEUE_NAMES.journeyRuns);
 
 const leadStages = new Set(['new', 'qualified', 'nurtured', 'converted', 'lost']);
 const supportedPlatforms = new Set(['whatsapp', 'twitter', 'instagram', 'tiktok']);
 const webhookStatuses = new Set(['pending', 'success', 'failed']);
 const messageStatuses = new Set(['pending', 'sent', 'delivered', 'read', 'failed']);
 const campaignStatuses = new Set(['draft', 'scheduled', 'running', 'completed', 'failed', 'canceled']);
+const journeyStatuses = new Set(['draft', 'active', 'paused', 'archived']);
+const journeyTriggerTypes = new Set(['inbound_message', 'tag_change', 'stage_change', 'time']);
+const journeyNodeTypes = new Set(['send_message', 'delay', 'condition', 'tag_update', 'webhook']);
+const attributionModels = new Set(['first_touch', 'last_touch', 'linear']);
 
 const createTrackingToken = () => crypto.randomBytes(16).toString('hex');
 
@@ -136,6 +142,148 @@ const normalizeTags = (input: unknown) => {
     .map((tag) => tag.trim())
     .filter((tag) => tag.length > 0);
 };
+
+const normalizeTagSet = (tags: string[]) =>
+  Array.from(new Set(tags.map((tag) => tag.trim()).filter((tag) => tag.length > 0)))
+    .sort()
+    .join('|');
+
+const enqueueJourneySignal = async (input: {
+  organizationId: string;
+  leadId: string;
+  triggerType: 'tag_change' | 'stage_change';
+  tags: string[];
+  stage?: string | null;
+  text?: string;
+}) => {
+  await journeyQueue.add(
+    'journey.trigger',
+    {
+      type: 'trigger',
+      triggerType: input.triggerType,
+      organizationId: input.organizationId,
+      leadId: input.leadId,
+      tags: input.tags,
+      stage: input.stage ?? undefined,
+      text: input.text,
+    },
+    defaultJobOptions
+  );
+};
+
+const normalizeJourneyStatus = (input: unknown) => {
+  const value = typeof input === 'string' ? input.trim() : '';
+  return journeyStatuses.has(value) ? value : 'draft';
+};
+
+const normalizeJourneyTriggers = (input: unknown) => {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+      const item = entry as Record<string, unknown>;
+      const type = typeof item.type === 'string' ? item.type.trim() : '';
+      if (!journeyTriggerTypes.has(type)) {
+        return null;
+      }
+      const enabled = typeof item.enabled === 'boolean' ? item.enabled : true;
+      const config =
+        item.config && typeof item.config === 'object' && !Array.isArray(item.config)
+          ? (item.config as Record<string, unknown>)
+          : null;
+      return { type, enabled, config };
+    })
+    .filter((trigger): trigger is { type: string; enabled: boolean; config: Record<string, unknown> | null } =>
+      !!trigger
+    );
+};
+
+const normalizeJourneyNodes = (input: unknown) => {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+      const item = entry as Record<string, unknown>;
+      const id =
+        typeof item.id === 'string' && item.id.trim().length > 0
+          ? item.id.trim()
+          : crypto.randomUUID();
+      const type = typeof item.type === 'string' ? item.type.trim() : '';
+      if (!journeyNodeTypes.has(type)) {
+        return null;
+      }
+      const label = typeof item.label === 'string' ? item.label.trim() : null;
+      const config =
+        item.config && typeof item.config === 'object' && !Array.isArray(item.config)
+          ? (item.config as Record<string, unknown>)
+          : null;
+      const position =
+        item.position && typeof item.position === 'object' && !Array.isArray(item.position)
+          ? (item.position as Record<string, unknown>)
+          : null;
+      return { id, type, label, config, position };
+    })
+    .filter((node): node is { id: string; type: string; label: string | null; config: Record<string, unknown> | null; position: Record<string, unknown> | null } =>
+      !!node
+    );
+};
+
+const normalizeJourneyEdges = (input: unknown) => {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+      const item = entry as Record<string, unknown>;
+      const id =
+        typeof item.id === 'string' && item.id.trim().length > 0
+          ? item.id.trim()
+          : crypto.randomUUID();
+      const fromNodeId = typeof item.fromNodeId === 'string' ? item.fromNodeId.trim() : '';
+      const toNodeId = typeof item.toNodeId === 'string' ? item.toNodeId.trim() : '';
+      if (!fromNodeId || !toNodeId) {
+        return null;
+      }
+      const label = typeof item.label === 'string' ? item.label.trim() : null;
+      const config =
+        item.config && typeof item.config === 'object' && !Array.isArray(item.config)
+          ? (item.config as Record<string, unknown>)
+          : null;
+      return { id, fromNodeId, toNodeId, label, config };
+    })
+    .filter((edge): edge is { id: string; fromNodeId: string; toNodeId: string; label: string | null; config: Record<string, unknown> | null } =>
+      !!edge
+    );
+};
+
+const defaultIntentTaxonomy = [
+  { id: 'pricing', name: 'Pricing' },
+  { id: 'purchase', name: 'Purchase intent' },
+  { id: 'product_info', name: 'Product info' },
+  { id: 'promo', name: 'Promotions' },
+  { id: 'demo', name: 'Demo or trial' },
+  { id: 'shipping', name: 'Shipping' },
+  { id: 'returns', name: 'Returns or refunds' },
+  { id: 'complaint', name: 'Complaint' },
+  { id: 'availability', name: 'Availability' },
+  { id: 'payment', name: 'Payment issue' },
+  { id: 'comparison', name: 'Competitor comparison' },
+  { id: 'human_handoff', name: 'Human handoff' },
+];
 
 const applyConversionUpdate = (currentStage: string, updates: Record<string, unknown>) => {
   if (typeof updates.stage !== 'string') {
@@ -1881,6 +2029,96 @@ const buildSegmentWhere = (
 
 const normalizePhone = (phone: string) => phone.replace(/[^\d+]/g, '').replace(/^\+/, '');
 
+const WEBHOOK_SIGNATURE_HEADER = 'x-omini-signature';
+const WEBHOOK_TIMESTAMP_HEADER = 'x-omini-timestamp';
+const DEFAULT_WEBHOOK_TTL_MS = 5 * 60 * 1000;
+
+const isWebhookSignatureRequired = () => {
+  const raw = process.env.WEBHOOK_SIGNATURE_REQUIRED;
+  return raw === 'true' || raw === '1';
+};
+
+const resolveWebhookTtlMs = () => {
+  const raw = process.env.WEBHOOK_SIGNATURE_TTL_MS;
+  const parsed = raw ? Number(raw) : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_WEBHOOK_TTL_MS;
+  }
+  return Math.floor(parsed);
+};
+
+const resolveWebhookSecret = (channel: {
+  credentials: unknown;
+  settings: unknown;
+}) => {
+  const credentials =
+    channel.credentials && typeof channel.credentials === 'object' && !Array.isArray(channel.credentials)
+      ? (channel.credentials as Record<string, unknown>)
+      : null;
+  const settings =
+    channel.settings && typeof channel.settings === 'object' && !Array.isArray(channel.settings)
+      ? (channel.settings as Record<string, unknown>)
+      : null;
+
+  const credentialSecret =
+    typeof credentials?.webhookSecret === 'string' ? credentials.webhookSecret.trim() : '';
+  if (credentialSecret) return credentialSecret;
+
+  const settingsSecret =
+    typeof settings?.webhookSecret === 'string' ? settings.webhookSecret.trim() : '';
+  if (settingsSecret) return settingsSecret;
+
+  const envSecret = process.env.WEBHOOK_SIGNING_SECRET;
+  return envSecret ? envSecret.trim() : '';
+};
+
+const parseWebhookTimestamp = (raw: string) => {
+  if (!raw) return null;
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber)) {
+    return new Date(asNumber);
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+};
+
+const buildWebhookSignature = (secret: string, timestamp: string, rawBody: string) =>
+  crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
+
+const verifyWebhookSignature = (input: {
+  secret: string;
+  signature: string;
+  timestamp: string;
+  rawBody: string;
+}) => {
+  if (!input.signature || !input.timestamp) {
+    return false;
+  }
+
+  const timestamp = parseWebhookTimestamp(input.timestamp);
+  if (!timestamp) {
+    return false;
+  }
+
+  const ttlMs = resolveWebhookTtlMs();
+  const ageMs = Math.abs(Date.now() - timestamp.getTime());
+  if (ageMs > ttlMs) {
+    return false;
+  }
+
+  const expected = buildWebhookSignature(input.secret, input.timestamp, input.rawBody);
+  if (expected.length !== input.signature.length) {
+    return false;
+  }
+
+  const expectedBuffer = Buffer.from(expected);
+  const providedBuffer = Buffer.from(input.signature);
+  return crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+};
+
 const shouldSendCrmEvent = (settings: Record<string, unknown>, eventType: string) => {
   const raw = settings.crmWebhook as Record<string, unknown> | undefined;
   if (!raw || typeof raw.url !== 'string') {
@@ -1998,13 +2236,6 @@ app.post('/v1/webhooks/whatsapp/:provider/:channelId', async (c) => {
   const channelId = c.req.param('channelId');
 
   const rawBody = await c.req.text();
-  let payload: Record<string, unknown>;
-
-  try {
-    payload = JSON.parse(rawBody) as Record<string, unknown>;
-  } catch {
-    return c.json({ error: 'invalid_payload' }, 400);
-  }
 
   const channel = await prisma.channel.findUnique({
     where: { id: channelId },
@@ -2032,6 +2263,43 @@ app.post('/v1/webhooks/whatsapp/:provider/:channelId', async (c) => {
     return c.json({ error: 'unsupported_provider' }, 400);
   }
 
+  const signatureRequired = isWebhookSignatureRequired();
+  const secret = resolveWebhookSecret(channel);
+  if (signatureRequired && !secret) {
+    console.warn('Webhook signature required but secret missing', {
+      channelId,
+      provider,
+      path: c.req.path,
+    });
+    return c.json({ error: 'webhook_signature_required' }, 401);
+  }
+  if (secret) {
+    const signature = c.req.header(WEBHOOK_SIGNATURE_HEADER) ?? '';
+    const timestamp = c.req.header(WEBHOOK_TIMESTAMP_HEADER) ?? '';
+    const valid = verifyWebhookSignature({
+      secret,
+      signature,
+      timestamp,
+      rawBody,
+    });
+    if (!valid) {
+      console.warn('Webhook signature invalid', {
+        channelId,
+        provider,
+        path: c.req.path,
+      });
+      return c.json({ error: 'unauthorized' }, 401);
+    }
+  }
+
+  let payload: Record<string, unknown>;
+
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
   const headers = Object.fromEntries(c.req.raw.headers.entries());
 
   await inboundQueue.add(
@@ -2053,13 +2321,6 @@ app.post('/v1/webhooks/whatsapp/:provider/:channelId/status', async (c) => {
   const channelId = c.req.param('channelId');
 
   const rawBody = await c.req.text();
-  let payload: Record<string, unknown>;
-
-  try {
-    payload = JSON.parse(rawBody) as Record<string, unknown>;
-  } catch {
-    return c.json({ error: 'invalid_payload' }, 400);
-  }
 
   const channel = await prisma.channel.findUnique({
     where: { id: channelId },
@@ -2085,6 +2346,38 @@ app.post('/v1/webhooks/whatsapp/:provider/:channelId/status', async (c) => {
   const adapter = getWhatsAppAdapter(provider);
   if (!adapter?.parseStatus) {
     return c.json({ error: 'unsupported_provider' }, 400);
+  }
+
+  const signatureRequired = isWebhookSignatureRequired();
+  const secret = resolveWebhookSecret(channel);
+  if (signatureRequired && !secret) {
+    console.warn('Webhook signature required but secret missing', {
+      channelId,
+      provider,
+      path: c.req.path,
+    });
+    return c.json({ error: 'webhook_signature_required' }, 401);
+  }
+  if (secret) {
+    const signature = c.req.header(WEBHOOK_SIGNATURE_HEADER) ?? '';
+    const timestamp = c.req.header(WEBHOOK_TIMESTAMP_HEADER) ?? '';
+    const valid = verifyWebhookSignature({
+      secret,
+      signature,
+      timestamp,
+      rawBody,
+    });
+    if (!valid) {
+      return c.json({ error: 'unauthorized' }, 401);
+    }
+  }
+
+  let payload: Record<string, unknown>;
+
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: 'invalid_payload' }, 400);
   }
 
   const headers = Object.fromEntries(c.req.raw.headers.entries());
@@ -3107,6 +3400,189 @@ api.get('/v1/analytics/trends/campaigns', async (c) => {
   });
 });
 
+const resolveInsightWindow = async (
+  organizationId: string,
+  windowRaw: string | null | undefined,
+  model: 'intent' | 'cluster' | 'suggestion'
+) => {
+  const parsed = parseDate(windowRaw ?? null);
+  if (parsed) {
+    return parsed;
+  }
+
+  if (model === 'intent') {
+    const latest = await prisma.aiIntentWindow.findFirst({
+      where: { organizationId },
+      orderBy: { windowStart: 'desc' },
+      select: { windowStart: true },
+    });
+    return latest?.windowStart ?? null;
+  }
+
+  if (model === 'cluster') {
+    const latest = await prisma.aiTopicCluster.findFirst({
+      where: { organizationId },
+      orderBy: { windowStart: 'desc' },
+      select: { windowStart: true },
+    });
+    return latest?.windowStart ?? null;
+  }
+
+  const latest = await prisma.aiReplySuggestion.findFirst({
+    where: { organizationId },
+    orderBy: { windowStart: 'desc' },
+    select: { windowStart: true },
+  });
+  return latest?.windowStart ?? null;
+};
+
+api.get('/v1/insights/intents/taxonomy', async (c) => {
+  return c.json({ intents: defaultIntentTaxonomy });
+});
+
+api.get('/v1/insights/intents', async (c) => {
+  const windowStart = await resolveInsightWindow(
+    c.get('tenantId'),
+    c.req.query('windowStart'),
+    'intent'
+  );
+
+  if (!windowStart) {
+    return c.json({ windowStart: null, intents: [] });
+  }
+
+  const intents = await prisma.aiIntentWindow.findMany({
+    where: { organizationId: c.get('tenantId'), windowStart },
+    orderBy: { count: 'desc' },
+  });
+
+  return c.json({ windowStart: windowStart.toISOString(), intents });
+});
+
+api.get('/v1/insights/clusters', async (c) => {
+  const windowStart = await resolveInsightWindow(
+    c.get('tenantId'),
+    c.req.query('windowStart'),
+    'cluster'
+  );
+
+  if (!windowStart) {
+    return c.json({ windowStart: null, clusters: [] });
+  }
+
+  const clusters = await prisma.aiTopicCluster.findMany({
+    where: { organizationId: c.get('tenantId'), windowStart },
+    orderBy: { count: 'desc' },
+  });
+
+  return c.json({ windowStart: windowStart.toISOString(), clusters });
+});
+
+api.get('/v1/insights/suggestions', async (c) => {
+  const windowStart = await resolveInsightWindow(
+    c.get('tenantId'),
+    c.req.query('windowStart'),
+    'suggestion'
+  );
+
+  if (!windowStart) {
+    return c.json({ windowStart: null, suggestions: [] });
+  }
+
+  const suggestions = await prisma.aiReplySuggestion.findMany({
+    where: { organizationId: c.get('tenantId'), windowStart },
+    orderBy: { intent: 'asc' },
+  });
+
+  return c.json({ windowStart: windowStart.toISOString(), suggestions });
+});
+
+api.get('/v1/attribution/report', async (c) => {
+  const modelRaw = c.req.query('model');
+  const model =
+    typeof modelRaw === 'string' && attributionModels.has(modelRaw)
+      ? modelRaw
+      : 'last_touch';
+  const { start, end } = resolveDateRange(c.req.query('start'), c.req.query('end'));
+
+  const touchpoints = await prisma.attributionTouchpoint.findMany({
+    where: {
+      organizationId: c.get('tenantId'),
+      model: model as Prisma.AttributionModel,
+      touchedAt: { gte: start, lt: end },
+    },
+  });
+
+  const sumBy = <T extends { weight: number }>(items: T[]) =>
+    items.reduce((total, item) => total + item.weight, 0);
+
+  const groupBy = <T extends { key: string | null }>(items: T[]) => {
+    const map = new Map<string, number>();
+    for (const item of items) {
+      if (!item.key) continue;
+      map.set(item.key, (map.get(item.key) ?? 0) + item.weight);
+    }
+    return map;
+  };
+
+  const channelMap = groupBy(
+    touchpoints.map((item) => ({ key: item.channelId, weight: item.weight }))
+  );
+  const campaignMap = groupBy(
+    touchpoints.map((item) => ({ key: item.campaignId, weight: item.weight }))
+  );
+  const journeyMap = groupBy(
+    touchpoints.map((item) => ({ key: item.journeyId, weight: item.weight }))
+  );
+
+  const channelIds = Array.from(channelMap.keys());
+  const campaignIds = Array.from(campaignMap.keys());
+  const journeyIds = Array.from(journeyMap.keys());
+
+  const [channels, campaigns, journeys] = await Promise.all([
+    channelIds.length
+      ? prisma.channel.findMany({
+          where: { id: { in: channelIds }, organizationId: c.get('tenantId') },
+          select: { id: true, name: true, platform: true, provider: true },
+        })
+      : [],
+    campaignIds.length
+      ? prisma.campaign.findMany({
+          where: { id: { in: campaignIds }, organizationId: c.get('tenantId') },
+          select: { id: true, name: true, status: true, cost: true, revenue: true },
+        })
+      : [],
+    journeyIds.length
+      ? prisma.journey.findMany({
+          where: { id: { in: journeyIds }, organizationId: c.get('tenantId') },
+          select: { id: true, name: true, status: true },
+        })
+      : [],
+  ]);
+
+  const channelLookup = new Map(channels.map((item) => [item.id, item]));
+  const campaignLookup = new Map(campaigns.map((item) => [item.id, item]));
+  const journeyLookup = new Map(journeys.map((item) => [item.id, item]));
+
+  return c.json({
+    model,
+    range: { start: start.toISOString(), end: end.toISOString() },
+    totalWeight: sumBy(touchpoints),
+    channels: Array.from(channelMap.entries()).map(([id, weight]) => ({
+      channel: channelLookup.get(id) ?? null,
+      weight,
+    })),
+    campaigns: Array.from(campaignMap.entries()).map(([id, weight]) => ({
+      campaign: campaignLookup.get(id) ?? null,
+      weight,
+    })),
+    journeys: Array.from(journeyMap.entries()).map(([id, weight]) => ({
+      journey: journeyLookup.get(id) ?? null,
+      weight,
+    })),
+  });
+});
+
 api.get('/v1/agent/optimizations', async (c) => {
   const status = c.req.query('status');
   const campaignId = c.req.query('campaignId');
@@ -3735,6 +4211,9 @@ api.post('/v1/crm/leads/:id', async (c) => {
     return c.json({ error: 'lead_not_found' }, 404);
   }
 
+  const originalTags = lead.tags ?? [];
+  const originalStage = lead.stage;
+
   const updates: Record<string, unknown> = {};
   if (typeof body.stage === 'string') {
     updates.stage = body.stage;
@@ -3764,6 +4243,29 @@ api.post('/v1/crm/leads/:id', async (c) => {
   }
 
   const updatedLead = await applyLeadUpdate(lead, updates);
+
+  const tagsChanged = normalizeTagSet(updatedLead.tags ?? []) !== normalizeTagSet(originalTags);
+  const stageChanged = updatedLead.stage !== originalStage;
+
+  if (tagsChanged) {
+    await enqueueJourneySignal({
+      organizationId: c.get('tenantId'),
+      leadId: updatedLead.id,
+      triggerType: 'tag_change',
+      tags: updatedLead.tags ?? [],
+      stage: updatedLead.stage,
+    });
+  }
+
+  if (stageChanged) {
+    await enqueueJourneySignal({
+      organizationId: c.get('tenantId'),
+      leadId: updatedLead.id,
+      triggerType: 'stage_change',
+      tags: updatedLead.tags ?? [],
+      stage: updatedLead.stage,
+    });
+  }
 
   return c.json({ lead: updatedLead });
 });
@@ -4083,6 +4585,9 @@ api.post('/v1/leads/:id/signals', async (c) => {
     return c.json({ error: 'lead_not_found' }, 404);
   }
 
+  const originalTags = lead.tags ?? [];
+  const originalStage = lead.stage;
+
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   const leadRules = getLeadRulesFromSettings(settings);
 
@@ -4161,6 +4666,31 @@ api.post('/v1/leads/:id/signals', async (c) => {
     );
   }
 
+  const tagsChanged = normalizeTagSet(updatedLead.tags ?? []) !== normalizeTagSet(originalTags);
+  const stageChanged = updatedLead.stage !== originalStage;
+
+  if (tagsChanged) {
+    await enqueueJourneySignal({
+      organizationId: c.get('tenantId'),
+      leadId: updatedLead.id,
+      triggerType: 'tag_change',
+      tags: updatedLead.tags ?? [],
+      stage: updatedLead.stage,
+      text,
+    });
+  }
+
+  if (stageChanged) {
+    await enqueueJourneySignal({
+      organizationId: c.get('tenantId'),
+      leadId: updatedLead.id,
+      triggerType: 'stage_change',
+      tags: updatedLead.tags ?? [],
+      stage: updatedLead.stage,
+      text,
+    });
+  }
+
   return c.json({
     lead: updatedLead,
     matchedRules: ruleResult?.matchedRules ?? [],
@@ -4197,6 +4727,9 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
     return c.json({ error: 'lead_not_found' }, 404);
   }
 
+  const originalTags = lead.tags ?? [];
+  const originalStage = lead.stage;
+
   const agentResult = await runLeadAgentWorkflow({
     organizationId: c.get('tenantId'),
     leadId: lead.id,
@@ -4212,6 +4745,32 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
 
   if (!agentResult.lead) {
     return c.json({ error: 'lead_not_found' }, 404);
+  }
+
+  const tagsChanged =
+    normalizeTagSet(agentResult.lead.tags ?? []) !== normalizeTagSet(originalTags);
+  const stageChanged = agentResult.lead.stage !== originalStage;
+
+  if (tagsChanged) {
+    await enqueueJourneySignal({
+      organizationId: c.get('tenantId'),
+      leadId: agentResult.lead.id,
+      triggerType: 'tag_change',
+      tags: agentResult.lead.tags ?? [],
+      stage: agentResult.lead.stage,
+      text,
+    });
+  }
+
+  if (stageChanged) {
+    await enqueueJourneySignal({
+      organizationId: c.get('tenantId'),
+      leadId: agentResult.lead.id,
+      triggerType: 'stage_change',
+      tags: agentResult.lead.tags ?? [],
+      stage: agentResult.lead.stage,
+      text,
+    });
   }
 
   return c.json({
@@ -4483,6 +5042,258 @@ api.post('/v1/campaigns/:id/schedule', async (c) => {
   return c.json({ campaign: updated });
 });
 
+api.post('/v1/campaigns/:id/cancel', async (c) => {
+  const campaign = await prisma.campaign.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!campaign) {
+    return c.json({ error: 'campaign_not_found' }, 404);
+  }
+
+  if (campaign.status === 'completed' || campaign.status === 'failed') {
+    return c.json({ error: 'campaign_not_cancelable' }, 409);
+  }
+
+  if (campaign.status === 'canceled') {
+    return c.json({ campaign });
+  }
+
+  const updated = await prisma.campaign.update({
+    where: { id: campaign.id },
+    data: {
+      status: 'canceled',
+      scheduledAt: null,
+      completedAt: new Date(),
+    },
+    include: { segment: true, channel: true },
+  });
+
+  return c.json({ campaign: updated });
+});
+
+api.get('/v1/journeys', async (c) => {
+  const journeys = await prisma.journey.findMany({
+    where: { organizationId: c.get('tenantId') },
+    orderBy: { createdAt: 'desc' },
+    include: {
+      triggers: true,
+      nodes: true,
+      edges: true,
+    },
+  });
+
+  return c.json({ journeys });
+});
+
+api.post('/v1/journeys', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+
+  if (!name) {
+    return c.json({ error: 'invalid_payload' }, 400);
+  }
+
+  const description = typeof body.description === 'string' ? body.description.trim() : null;
+  const status = normalizeJourneyStatus(body.status);
+  const triggers = normalizeJourneyTriggers(body.triggers);
+  const nodes = normalizeJourneyNodes(body.nodes);
+  const edges = normalizeJourneyEdges(body.edges);
+
+  const journey = await prisma.$transaction(async (tx) => {
+    const created = await tx.journey.create({
+      data: {
+        organizationId: c.get('tenantId'),
+        name,
+        description,
+        status,
+      },
+    });
+
+    if (triggers.length > 0) {
+      await tx.journeyTrigger.createMany({
+        data: triggers.map((trigger) => ({
+          organizationId: c.get('tenantId'),
+          journeyId: created.id,
+          type: trigger.type,
+          enabled: trigger.enabled,
+          config: trigger.config,
+        })),
+      });
+    }
+
+    if (nodes.length > 0) {
+      await tx.journeyNode.createMany({
+        data: nodes.map((node) => ({
+          id: node.id,
+          organizationId: c.get('tenantId'),
+          journeyId: created.id,
+          type: node.type,
+          label: node.label,
+          config: node.config,
+          position: node.position,
+        })),
+      });
+    }
+
+    if (edges.length > 0) {
+      await tx.journeyEdge.createMany({
+        data: edges.map((edge) => ({
+          id: edge.id,
+          organizationId: c.get('tenantId'),
+          journeyId: created.id,
+          fromNodeId: edge.fromNodeId,
+          toNodeId: edge.toNodeId,
+          label: edge.label,
+          config: edge.config,
+        })),
+      });
+    }
+
+    return tx.journey.findUnique({
+      where: { id: created.id },
+      include: { triggers: true, nodes: true, edges: true },
+    });
+  });
+
+  return c.json({ journey }, 201);
+});
+
+api.get('/v1/journeys/:id', async (c) => {
+  const journey = await prisma.journey.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+    include: {
+      triggers: true,
+      nodes: true,
+      edges: true,
+    },
+  });
+
+  if (!journey) {
+    return c.json({ error: 'journey_not_found' }, 404);
+  }
+
+  return c.json({ journey });
+});
+
+api.put('/v1/journeys/:id', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const journey = await prisma.journey.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!journey) {
+    return c.json({ error: 'journey_not_found' }, 404);
+  }
+
+  const name = typeof body.name === 'string' ? body.name.trim() : journey.name;
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : journey.description;
+  const status = body.status ? normalizeJourneyStatus(body.status) : journey.status;
+  const triggers = normalizeJourneyTriggers(body.triggers);
+  const nodes = normalizeJourneyNodes(body.nodes);
+  const edges = normalizeJourneyEdges(body.edges);
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.journey.update({
+      where: { id: journey.id },
+      data: {
+        name,
+        description,
+        status,
+      },
+    });
+
+    await tx.journeyTrigger.deleteMany({ where: { journeyId: journey.id } });
+    if (triggers.length > 0) {
+      await tx.journeyTrigger.createMany({
+        data: triggers.map((trigger) => ({
+          organizationId: c.get('tenantId'),
+          journeyId: journey.id,
+          type: trigger.type,
+          enabled: trigger.enabled,
+          config: trigger.config,
+        })),
+      });
+    }
+
+    await tx.journeyEdge.deleteMany({ where: { journeyId: journey.id } });
+    if (edges.length > 0) {
+      await tx.journeyEdge.createMany({
+        data: edges.map((edge) => ({
+          id: edge.id,
+          organizationId: c.get('tenantId'),
+          journeyId: journey.id,
+          fromNodeId: edge.fromNodeId,
+          toNodeId: edge.toNodeId,
+          label: edge.label,
+          config: edge.config,
+        })),
+      });
+    }
+
+    for (const node of nodes) {
+      await tx.journeyNode.upsert({
+        where: { id: node.id },
+        update: {
+          type: node.type,
+          label: node.label,
+          config: node.config,
+          position: node.position,
+        },
+        create: {
+          id: node.id,
+          organizationId: c.get('tenantId'),
+          journeyId: journey.id,
+          type: node.type,
+          label: node.label,
+          config: node.config,
+          position: node.position,
+        },
+      });
+    }
+
+    return tx.journey.findUnique({
+      where: { id: journey.id },
+      include: { triggers: true, nodes: true, edges: true },
+    });
+  });
+
+  return c.json({ journey: updated });
+});
+
+api.get('/v1/journeys/:id/runs', async (c) => {
+  const journey = await prisma.journey.findFirst({
+    where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
+  });
+
+  if (!journey) {
+    return c.json({ error: 'journey_not_found' }, 404);
+  }
+
+  const limitRaw = c.req.query('limit');
+  const offsetRaw = c.req.query('offset');
+  const parseNumber = (value: string | undefined, fallback: number) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const limit = Math.min(100, Math.max(1, parseNumber(limitRaw, 25)));
+  const offset = Math.max(0, parseNumber(offsetRaw, 0));
+
+  const [runs, total] = await Promise.all([
+    prisma.journeyRun.findMany({
+      where: { journeyId: journey.id },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+      include: { steps: true },
+    }),
+    prisma.journeyRun.count({ where: { journeyId: journey.id } }),
+  ]);
+
+  return c.json({ runs, total, limit, offset });
+});
+
 api.get('/v1/channels', async (c) => {
   const channels = await prisma.channel.findMany({
     where: { organizationId: c.get('tenantId') },
@@ -4623,10 +5434,10 @@ api.post('/v1/mock/whatsapp/inbound', async (c) => {
     return c.json({ error: 'unsupported_platform' }, 400);
   }
 
-  const provider = channel.provider.toLowerCase();
-  if (!provider) {
+  if (!channel.provider) {
     return c.json({ error: 'provider_required' }, 400);
   }
+  const provider = channel.provider.toLowerCase();
 
   const adapter = getWhatsAppAdapter(provider);
   if (!adapter) {

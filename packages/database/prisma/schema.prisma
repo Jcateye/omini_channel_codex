@@ -75,7 +75,47 @@ enum CampaignSendStatus {
 }
 
 enum AttributionModel {
+  first_touch
   last_touch
+  linear
+}
+
+enum JourneyStatus {
+  draft
+  active
+  paused
+  archived
+}
+
+enum JourneyTriggerType {
+  inbound_message
+  tag_change
+  stage_change
+  time
+}
+
+enum JourneyNodeType {
+  send_message
+  delay
+  condition
+  tag_update
+  webhook
+}
+
+enum JourneyRunStatus {
+  pending
+  running
+  completed
+  failed
+  canceled
+}
+
+enum JourneyStepStatus {
+  pending
+  running
+  completed
+  failed
+  skipped
 }
 
 enum ToolKind {
@@ -158,6 +198,16 @@ model Organization {
   promptUsages       PromptUsage[]
   toolExecutionLogs  ToolExecutionLog[]
   revenueEvents      RevenueEvent[]
+  journeys           Journey[]
+  journeyTriggers    JourneyTrigger[]
+  journeyNodes       JourneyNode[]
+  journeyEdges       JourneyEdge[]
+  journeyRuns        JourneyRun[]
+  journeyRunSteps    JourneyRunStep[]
+  attributionTouchpoints AttributionTouchpoint[]
+  aiIntentWindows    AiIntentWindow[]
+  aiTopicClusters    AiTopicCluster[]
+  aiReplySuggestions AiReplySuggestion[]
   agentMemories      AgentMemory[]
   knowledgeSources   KnowledgeSource[]
   knowledgeChunks    KnowledgeChunk[]
@@ -202,7 +252,9 @@ model Channel {
   messages      Message[]
   campaigns     Campaign[]
   leadAttributions LeadAttribution[]
+  attributionTouchpoints AttributionTouchpoint[]
   analyticsDaily   AnalyticsDaily[]
+  journeyRuns     JourneyRun[]
 
   @@index([organizationId])
   @@unique([organizationId, platform, externalId])
@@ -292,6 +344,8 @@ model Message {
   contact      Contact      @relation(fields: [contactId], references: [id])
   campaignSends CampaignSend[]
   leadAttributions LeadAttribution[]
+  journeyRunSteps JourneyRunStep[]
+  attributionTouchpoints AttributionTouchpoint[]
 
   @@index([organizationId])
   @@index([conversationId])
@@ -320,7 +374,9 @@ model Lead {
   conversation Conversation? @relation(fields: [conversationId], references: [id])
   campaignSends CampaignSend[]
   attributions LeadAttribution[]
+  attributionTouchpoints AttributionTouchpoint[]
   revenueEvents RevenueEvent[]
+  journeyRuns  JourneyRun[]
   agentMemories AgentMemory[]
   agentRuns     AgentRun[]
   assignmentLogs LeadAssignmentLog[]
@@ -357,6 +413,7 @@ model Campaign {
   segment      CampaignSegment? @relation(fields: [segmentId], references: [id])
   sends        CampaignSend[]
   attributions LeadAttribution[]
+  attributionTouchpoints AttributionTouchpoint[]
   analyticsDaily AnalyticsDaily[]
   revenueEvents RevenueEvent[]
   agentRuns     AgentRun[]
@@ -406,6 +463,146 @@ model CampaignSend {
   @@unique([campaignId, leadId])
 }
 
+model Journey {
+  id             String        @id @default(uuid())
+  organizationId String
+  name           String
+  description    String?
+  status         JourneyStatus @default(draft)
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  triggers    JourneyTrigger[]
+  nodes       JourneyNode[]
+  edges       JourneyEdge[]
+  runs        JourneyRun[]
+  attributions AttributionTouchpoint[]
+
+  @@index([organizationId])
+  @@index([status])
+}
+
+model JourneyTrigger {
+  id             String             @id @default(uuid())
+  organizationId String
+  journeyId      String
+  type           JourneyTriggerType
+  enabled        Boolean            @default(true)
+  config         Json?
+  lastFiredAt    DateTime?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  journey      Journey      @relation(fields: [journeyId], references: [id])
+
+  @@index([organizationId])
+  @@index([journeyId])
+  @@index([type])
+}
+
+model JourneyNode {
+  id             String          @id @default(uuid())
+  organizationId String
+  journeyId      String
+  type           JourneyNodeType
+  label          String?
+  config         Json?
+  position       Json?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  journey      Journey      @relation(fields: [journeyId], references: [id])
+  outgoingEdges JourneyEdge[] @relation("JourneyEdgeFrom")
+  incomingEdges JourneyEdge[] @relation("JourneyEdgeTo")
+  runSteps     JourneyRunStep[]
+
+  @@index([organizationId])
+  @@index([journeyId])
+  @@index([type])
+}
+
+model JourneyEdge {
+  id             String   @id @default(uuid())
+  organizationId String
+  journeyId      String
+  fromNodeId     String
+  toNodeId       String
+  label          String?
+  config         Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  journey      Journey      @relation(fields: [journeyId], references: [id])
+  fromNode     JourneyNode  @relation("JourneyEdgeFrom", fields: [fromNodeId], references: [id])
+  toNode       JourneyNode  @relation("JourneyEdgeTo", fields: [toNodeId], references: [id])
+
+  @@index([organizationId])
+  @@index([journeyId])
+  @@index([fromNodeId])
+  @@index([toNodeId])
+}
+
+model JourneyRun {
+  id             String           @id @default(uuid())
+  organizationId String
+  journeyId      String
+  leadId         String?
+  contactId      String?
+  channelId      String?
+  triggerType    JourneyTriggerType
+  triggerPayload Json?
+  status         JourneyRunStatus @default(pending)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  journey      Journey      @relation(fields: [journeyId], references: [id])
+  lead         Lead?        @relation(fields: [leadId], references: [id])
+  contact      Contact?     @relation(fields: [contactId], references: [id])
+  channel      Channel?     @relation(fields: [channelId], references: [id])
+  steps        JourneyRunStep[]
+  attributions AttributionTouchpoint[]
+
+  @@index([organizationId])
+  @@index([journeyId])
+  @@index([leadId])
+  @@index([status])
+}
+
+model JourneyRunStep {
+  id             String           @id @default(uuid())
+  organizationId String
+  runId          String
+  nodeId         String
+  status         JourneyStepStatus @default(pending)
+  attempt        Int              @default(0)
+  scheduledFor   DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  errorMessage   String?
+  output         Json?
+  messageId      String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  run          JourneyRun  @relation(fields: [runId], references: [id])
+  node         JourneyNode @relation(fields: [nodeId], references: [id])
+  message      Message?    @relation(fields: [messageId], references: [id])
+
+  @@index([organizationId])
+  @@index([runId])
+  @@index([nodeId])
+  @@index([status])
+}
+
 model WebhookDelivery {
   id             String                @id @default(uuid())
   organizationId String
@@ -422,6 +619,56 @@ model WebhookDelivery {
   organization Organization @relation(fields: [organizationId], references: [id])
 
   @@index([organizationId])
+}
+
+model AiIntentWindow {
+  id             String   @id @default(uuid())
+  organizationId String
+  windowStart    DateTime
+  intent         String
+  count          Int      @default(0)
+  sampleMessages Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+  @@index([windowStart])
+  @@index([intent])
+  @@unique([organizationId, windowStart, intent])
+}
+
+model AiTopicCluster {
+  id             String   @id @default(uuid())
+  organizationId String
+  windowStart    DateTime
+  label          String
+  count          Int      @default(0)
+  sampleMessages Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+  @@index([windowStart])
+  @@index([label])
+  @@unique([organizationId, windowStart, label])
+}
+
+model AiReplySuggestion {
+  id             String   @id @default(uuid())
+  organizationId String
+  windowStart    DateTime
+  intent         String
+  suggestions    Json
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+  @@index([windowStart])
+  @@index([intent])
+  @@unique([organizationId, windowStart, intent])
 }
 
 model ToolDefinition {
@@ -529,6 +776,7 @@ model LeadAttribution {
   campaignId     String?
   messageId      String?
   channelId      String?
+  journeyId      String?
   model          AttributionModel @default(last_touch)
   attributedAt   DateTime
   createdAt      DateTime         @default(now())
@@ -539,12 +787,45 @@ model LeadAttribution {
   campaign     Campaign?    @relation(fields: [campaignId], references: [id])
   message      Message?     @relation(fields: [messageId], references: [id])
   channel      Channel?     @relation(fields: [channelId], references: [id])
+  journey      Journey?     @relation(fields: [journeyId], references: [id])
 
   @@unique([leadId, model])
   @@index([organizationId])
   @@index([campaignId])
   @@index([channelId])
+  @@index([journeyId])
   @@index([attributedAt])
+}
+
+model AttributionTouchpoint {
+  id             String           @id @default(uuid())
+  organizationId String
+  leadId         String
+  model          AttributionModel @default(last_touch)
+  campaignId     String?
+  journeyId      String?
+  journeyRunId   String?
+  messageId      String?
+  channelId      String?
+  weight         Float            @default(1)
+  touchedAt      DateTime
+  createdAt      DateTime         @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead         @relation(fields: [leadId], references: [id])
+  campaign     Campaign?    @relation(fields: [campaignId], references: [id])
+  journey      Journey?     @relation(fields: [journeyId], references: [id])
+  journeyRun   JourneyRun?  @relation(fields: [journeyRunId], references: [id])
+  message      Message?     @relation(fields: [messageId], references: [id])
+  channel      Channel?     @relation(fields: [channelId], references: [id])
+
+  @@index([organizationId])
+  @@index([leadId])
+  @@index([campaignId])
+  @@index([journeyId])
+  @@index([journeyRunId])
+  @@index([channelId])
+  @@index([touchedAt])
 }
 
 model AnalyticsDaily {

@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 
@@ -104,6 +105,9 @@ const buildLeadWhere = (organizationId: string, segment: {
   return where;
 };
 
+const isDuplicateCampaignSend = (error: unknown) =>
+  error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+
 export const registerCampaignSendsWorker = () =>
   createWorker<CampaignSendJob>(QUEUE_NAMES.campaignSends, async ({ data }) => {
     if (!data?.campaignId) {
@@ -143,6 +147,14 @@ export const registerCampaignSendsWorker = () =>
 
     try {
       while (true) {
+        const latest = await prisma.campaign.findUnique({
+          where: { id: campaign.id },
+          select: { status: true },
+        });
+        if (latest?.status === 'canceled') {
+          return;
+        }
+
         const leads = await prisma.lead.findMany({
           where,
           take: pageSize,
@@ -166,6 +178,14 @@ export const registerCampaignSendsWorker = () =>
         }
 
         for (const lead of leads as unknown as LeadWithRelations[]) {
+          const existing = await prisma.campaignSend.findUnique({
+            where: { campaignId_leadId: { campaignId: campaign.id, leadId: lead.id } },
+            select: { id: true },
+          });
+          if (existing) {
+            continue;
+          }
+
           const contact = resolveContact(lead);
           if (!contact) {
             await prisma.$transaction([
@@ -213,59 +233,70 @@ export const registerCampaignSendsWorker = () =>
             externalId: recipient,
           });
 
-          const result = await prisma.$transaction(async (tx) => {
-            const message = await tx.message.create({
-              data: {
-                organizationId: campaign.organizationId,
-                conversationId: conversation.id,
-                channelId: campaign.channelId,
-                contactId: contact.id,
-                platform: 'whatsapp',
-                type: 'text',
-                direction: 'outbound',
-                status: 'pending',
-                content: {
-                  text: campaign.messageText,
-                  campaignId: campaign.id,
-                  campaignName: campaign.name,
+          try {
+            const result = await prisma.$transaction(async (tx) => {
+              const message = await tx.message.create({
+                data: {
+                  organizationId: campaign.organizationId,
+                  conversationId: conversation.id,
+                  channelId: campaign.channelId,
+                  contactId: contact.id,
+                  platform: 'whatsapp',
+                  type: 'text',
+                  direction: 'outbound',
+                  status: 'pending',
+                  content: {
+                    text: campaign.messageText,
+                    campaignId: campaign.id,
+                    campaignName: campaign.name,
+                  },
                 },
-              },
+              });
+
+              const campaignSend = await tx.campaignSend.create({
+                data: {
+                  organizationId: campaign.organizationId,
+                  campaignId: campaign.id,
+                  leadId: lead.id,
+                  messageId: message.id,
+                  status: 'queued',
+                },
+              });
+
+              await tx.campaign.update({
+                where: { id: campaign.id },
+                data: { totalQueued: { increment: 1 } },
+              });
+
+              return { message, campaignSend };
             });
 
-            const campaignSend = await tx.campaignSend.create({
-              data: {
-                organizationId: campaign.organizationId,
-                campaignId: campaign.id,
-                leadId: lead.id,
-                messageId: message.id,
-                status: 'queued',
-              },
-            });
-
-            await tx.campaign.update({
-              where: { id: campaign.id },
-              data: { totalQueued: { increment: 1 } },
-            });
-
-            return { message, campaignSend };
-          });
-
-          await outboundQueue.add('wa.send', { messageId: result.message.id }, defaultJobOptions);
+            await outboundQueue.add(
+              'wa.send',
+              { messageId: result.message.id },
+              defaultJobOptions
+            );
+          } catch (error) {
+            if (isDuplicateCampaignSend(error)) {
+              continue;
+            }
+            throw error;
+          }
         }
 
         offset += leads.length;
       }
 
-      await prisma.campaign.update({
-        where: { id: campaign.id },
+      await prisma.campaign.updateMany({
+        where: { id: campaign.id, status: { not: 'canceled' } },
         data: {
           status: 'completed',
           completedAt: new Date(),
         },
       });
     } catch (error) {
-      await prisma.campaign.update({
-        where: { id: campaign.id },
+      await prisma.campaign.updateMany({
+        where: { id: campaign.id, status: { not: 'canceled' } },
         data: {
           status: 'failed',
         },

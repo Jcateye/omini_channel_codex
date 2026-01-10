@@ -28,6 +28,10 @@ REDIS_URL="redis://localhost:6380"
 PORT="3100"
 API_BASE="http://localhost:3100"
 BOOTSTRAP_TOKEN="dev_bootstrap"
+WEBHOOK_SIGNING_SECRET=""
+WEBHOOK_SIGNATURE_TTL_MS="300000"
+WEBHOOK_SIGNATURE_REQUIRED="false"
+CRM_TOOL_API_KEY=""
 ```
 
 ## 4. Init Database (Prisma)

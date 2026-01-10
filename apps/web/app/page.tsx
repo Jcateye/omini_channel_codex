@@ -482,6 +482,12 @@ export default function Home() {
                 <Link href="/analytics">Analytics</Link>
               </Button>
               <Button variant="outline" asChild>
+                <Link href="/journeys">Journeys</Link>
+              </Button>
+              <Button variant="outline" asChild>
+                <Link href="/insights">AI Insights</Link>
+              </Button>
+              <Button variant="outline" asChild>
                 <Link href="/agent-intel">Agent</Link>
               </Button>
               <Button variant="outline" asChild>

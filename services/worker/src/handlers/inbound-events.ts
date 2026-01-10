@@ -2,6 +2,7 @@ import { applyLeadRules, type LeadRule } from '@omini/core';
 import { prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter, type InboundMessage } from '@omini/whatsapp-bsp';
+import { enqueueJourneyTrigger } from './journey-runs.js';
 
 export type InboundWebhookJob = {
   channelId: string;
@@ -246,6 +247,9 @@ const handleMessageEvent = async (
     conversation.id
   );
 
+  const previousTags = lead.tags ?? [];
+  const previousStage = lead.stage;
+
   let updatedLead = lead;
   let ruleResult: ReturnType<typeof applyLeadRules> | null = null;
 
@@ -276,6 +280,57 @@ const handleMessageEvent = async (
         data: updates,
       });
     }
+  }
+
+  const tagsChanged =
+    previousTags.length !== (updatedLead.tags ?? []).length ||
+    previousTags.some((tag) => !(updatedLead.tags ?? []).includes(tag));
+  const stageChanged = previousStage !== updatedLead.stage;
+
+  await enqueueJourneyTrigger({
+    type: 'trigger',
+    triggerType: 'inbound_message',
+    organizationId: channel.organizationId,
+    leadId: updatedLead.id,
+    contactId: contact.id,
+    channelId: channel.id,
+    conversationId: conversation.id,
+    messageId: inboundMessage.id,
+    text: parsed.text ?? undefined,
+    tags: updatedLead.tags ?? [],
+    stage: updatedLead.stage,
+  });
+
+  if (tagsChanged) {
+    await enqueueJourneyTrigger({
+      type: 'trigger',
+      triggerType: 'tag_change',
+      organizationId: channel.organizationId,
+      leadId: updatedLead.id,
+      contactId: contact.id,
+      channelId: channel.id,
+      conversationId: conversation.id,
+      messageId: inboundMessage.id,
+      text: parsed.text ?? undefined,
+      tags: updatedLead.tags ?? [],
+      stage: updatedLead.stage,
+    });
+  }
+
+  if (stageChanged) {
+    await enqueueJourneyTrigger({
+      type: 'trigger',
+      triggerType: 'stage_change',
+      organizationId: channel.organizationId,
+      leadId: updatedLead.id,
+      contactId: contact.id,
+      channelId: channel.id,
+      conversationId: conversation.id,
+      messageId: inboundMessage.id,
+      text: parsed.text ?? undefined,
+      tags: updatedLead.tags ?? [],
+      stage: updatedLead.stage,
+    });
   }
 
   if (created) {

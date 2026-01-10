@@ -24,6 +24,8 @@ type ToolDefinition = {
   description?: string | null;
   protocol: string;
   schema: Record<string, unknown>;
+  config?: Record<string, unknown> | null;
+  auth?: Record<string, unknown> | null;
   enabled: boolean;
   createdAt: string;
 };
@@ -55,9 +57,27 @@ type ToolExecutionLog = {
   tool?: ToolDefinition | null;
 };
 
+const buildToolPayload = (tool: ToolDefinition) => ({
+  name: tool.name,
+  version: tool.version,
+  kind: tool.kind,
+  provider: tool.provider ?? undefined,
+  description: tool.description ?? undefined,
+  protocol: tool.protocol,
+  schema: tool.schema,
+  config: tool.config ?? undefined,
+  auth: tool.auth ?? undefined,
+  enabled: tool.enabled,
+});
+
 export default function ToolsPage() {
   const [apiKey, setApiKey] = useState('');
   const [apiBase, setApiBase] = useState('');
+
+  const defaultSchema = '{"input": {}, "output": {}}';
+  const defaultConfig =
+    '{"adapterId":"external.http","url":"https://example.com/tools/lookup","method":"POST"}';
+  const defaultAuth = '{"scheme":"apiKey","secretRef":"CRM_TOOL_API_KEY"}';
 
   const [tools, setTools] = useState<ToolDefinition[]>([]);
   const [toolsError, setToolsError] = useState('');
@@ -68,7 +88,13 @@ export default function ToolsPage() {
   const [toolKind, setToolKind] = useState('internal');
   const [toolProvider, setToolProvider] = useState('');
   const [toolDescription, setToolDescription] = useState('');
-  const [toolSchema, setToolSchema] = useState('{"input": {}, "output": {}}');
+  const [toolSchema, setToolSchema] = useState(defaultSchema);
+  const [toolConfig, setToolConfig] = useState(
+    defaultConfig
+  );
+  const [toolAuth, setToolAuth] = useState(defaultAuth);
+  const [editingToolId, setEditingToolId] = useState<string | null>(null);
+  const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
 
   const [selectedToolId, setSelectedToolId] = useState('');
   const [permissions, setPermissions] = useState<ToolPermission[]>([]);
@@ -139,6 +165,92 @@ export default function ToolsPage() {
     return data;
   };
 
+  const getAdapterId = (tool: ToolDefinition) => {
+    const config =
+      tool.config && typeof tool.config === 'object' && !Array.isArray(tool.config)
+        ? tool.config
+        : null;
+    return typeof config?.adapterId === 'string' ? config.adapterId : '';
+  };
+
+  const getAuthScheme = (tool: ToolDefinition) => {
+    const auth =
+      tool.auth && typeof tool.auth === 'object' && !Array.isArray(tool.auth) ? tool.auth : null;
+    return typeof auth?.scheme === 'string' ? auth.scheme : '';
+  };
+
+  const stringifyJson = (value: unknown, fallback: string) => {
+    if (!value || typeof value !== 'object') {
+      return fallback;
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return fallback;
+    }
+  };
+
+  const resetToolEditor = () => {
+    setEditingToolId(null);
+    setToolName('crm.lookup');
+    setToolVersion('v1');
+    setToolKind('internal');
+    setToolProvider('');
+    setToolDescription('');
+    setToolSchema(defaultSchema);
+    setToolConfig(defaultConfig);
+    setToolAuth(defaultAuth);
+  };
+
+  const loadToolIntoEditor = (tool: ToolDefinition) => {
+    setEditingToolId(tool.id);
+    setSelectedToolId(tool.id);
+    setToolName(tool.name);
+    setToolVersion(tool.version);
+    setToolKind(tool.kind);
+    setToolProvider(tool.provider ?? '');
+    setToolDescription(tool.description ?? '');
+    setToolSchema(stringifyJson(tool.schema ?? { input: {}, output: {} }, defaultSchema));
+    setToolConfig(stringifyJson(tool.config ?? null, ''));
+    setToolAuth(stringifyJson(tool.auth ?? null, ''));
+  };
+
+  const copyText = async (value: string, fallback: string) => {
+    const text = value || fallback;
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setToolsStatus('Copied to clipboard.');
+      setToolsError('');
+    } catch (error) {
+      setToolsError('Copy failed.');
+    }
+  };
+
+  const toggleToolEnabled = async (tool: ToolDefinition) => {
+    setToolsError('');
+    setToolsStatus('');
+    try {
+      const data = await apiFetch<{ tool: ToolDefinition }>(`/v1/agent-tools/${tool.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: !tool.enabled,
+        }),
+      });
+      setTools((prev) => prev.map((item) => (item.id === tool.id ? data.tool : item)));
+      if (selectedToolId === tool.id) {
+        setSelectedToolId(tool.id);
+      }
+      setToolsStatus(data.tool.enabled ? 'Tool enabled.' : 'Tool disabled.');
+    } catch (err) {
+      setToolsError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const toggleToolExpanded = (toolId: string) => {
+    setExpandedTools((prev) => ({ ...prev, [toolId]: !prev[toolId] }));
+  };
+
   const loadTools = async () => {
     setToolsError('');
     setToolsStatus('');
@@ -170,6 +282,38 @@ export default function ToolsPage() {
       return;
     }
 
+    const config = (() => {
+      if (!toolConfig.trim()) {
+        return null;
+      }
+      try {
+        return JSON.parse(toolConfig);
+      } catch (error) {
+        setToolsError('Config JSON invalid');
+        return null;
+      }
+    })();
+
+    if (config === null && toolConfig.trim()) {
+      return;
+    }
+
+    const auth = (() => {
+      if (!toolAuth.trim()) {
+        return null;
+      }
+      try {
+        return JSON.parse(toolAuth);
+      } catch (error) {
+        setToolsError('Auth JSON invalid');
+        return null;
+      }
+    })();
+
+    if (auth === null && toolAuth.trim()) {
+      return;
+    }
+
     try {
       const data = await apiFetch<{ tool: ToolDefinition }>('/v1/agent-tools', {
         method: 'POST',
@@ -180,12 +324,90 @@ export default function ToolsPage() {
           provider: toolProvider || undefined,
           description: toolDescription || undefined,
           schema,
+          config,
+          auth,
           enabled: true,
         }),
       });
       setTools((prev) => [data.tool, ...prev]);
       setSelectedToolId(data.tool.id);
       setToolsStatus('Tool created.');
+    } catch (err) {
+      setToolsError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const updateTool = async () => {
+    setToolsError('');
+    setToolsStatus('');
+
+    if (!editingToolId) {
+      setToolsError('Select a tool to edit.');
+      return;
+    }
+
+    const schema = (() => {
+      try {
+        return JSON.parse(toolSchema);
+      } catch (error) {
+        setToolsError('Schema JSON invalid');
+        return null;
+      }
+    })();
+
+    if (!schema) {
+      return;
+    }
+
+    const config = (() => {
+      if (!toolConfig.trim()) {
+        return null;
+      }
+      try {
+        return JSON.parse(toolConfig);
+      } catch (error) {
+        setToolsError('Config JSON invalid');
+        return null;
+      }
+    })();
+
+    if (config === null && toolConfig.trim()) {
+      return;
+    }
+
+    const auth = (() => {
+      if (!toolAuth.trim()) {
+        return null;
+      }
+      try {
+        return JSON.parse(toolAuth);
+      } catch (error) {
+        setToolsError('Auth JSON invalid');
+        return null;
+      }
+    })();
+
+    if (auth === null && toolAuth.trim()) {
+      return;
+    }
+
+    try {
+      const data = await apiFetch<{ tool: ToolDefinition }>(`/v1/agent-tools/${editingToolId}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: toolName,
+          version: toolVersion,
+          kind: toolKind,
+          provider: toolProvider || undefined,
+          description: toolDescription || undefined,
+          schema,
+          config,
+          auth,
+          enabled: true,
+        }),
+      });
+      setTools((prev) => prev.map((tool) => (tool.id === data.tool.id ? data.tool : tool)));
+      setToolsStatus('Tool updated.');
     } catch (err) {
       setToolsError(err instanceof Error ? err.message : String(err));
     }
@@ -405,16 +627,80 @@ export default function ToolsPage() {
                           </Badge>
                           <Button
                             size="sm"
+                            variant="outline"
+                            onClick={() => toggleToolEnabled(tool)}
+                          >
+                            {tool.enabled ? 'Disable' : 'Enable'}
+                          </Button>
+                          <Button
+                            size="sm"
                             variant={selectedToolId === tool.id ? 'warm' : 'outline'}
                             onClick={() => setSelectedToolId(tool.id)}
                           >
                             {selectedToolId === tool.id ? 'Selected' : 'Use'}
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => loadToolIntoEditor(tool)}>
+                            Edit
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              copyText(
+                                stringifyJson(
+                                  buildToolPayload(tool),
+                                  ''
+                                ),
+                                ''
+                              )
+                            }
+                          >
+                            Copy JSON
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => copyText(stringifyJson(buildToolPayload(tool), ''), '')}
+                          >
+                            Copy Create Payload
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => toggleToolExpanded(tool.id)}
+                          >
+                            {expandedTools[tool.id] ? 'Hide details' : 'Show details'}
                           </Button>
                         </div>
                       </div>
                       <p className="mt-2 text-xs text-muted">
                         {tool.description || 'No description'}
                       </p>
+                      <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted">
+                        {getAdapterId(tool) ? (
+                          <span>Adapter: {getAdapterId(tool)}</span>
+                        ) : null}
+                        {getAuthScheme(tool) ? <span>Auth: {getAuthScheme(tool)}</span> : null}
+                        <span>Protocol: {tool.protocol}</span>
+                      </div>
+                      {expandedTools[tool.id] ? (
+                        <div className="mt-3 grid gap-3 text-xs">
+                          <div>
+                            <p className="text-[11px] uppercase tracking-[0.2em] text-muted">
+                              Config
+                            </p>
+                            <pre className="mt-1 whitespace-pre-wrap rounded-lg border border-ink/10 bg-slate-50 px-3 py-2 text-[11px] text-ink">
+                              {stringifyJson(tool.config ?? {}, '{}')}
+                            </pre>
+                          </div>
+                          <div>
+                            <p className="text-[11px] uppercase tracking-[0.2em] text-muted">Auth</p>
+                            <pre className="mt-1 whitespace-pre-wrap rounded-lg border border-ink/10 bg-slate-50 px-3 py-2 text-[11px] text-ink">
+                              {stringifyJson(tool.auth ?? {}, '{}')}
+                            </pre>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -425,9 +711,17 @@ export default function ToolsPage() {
           <Card>
             <div className="flex flex-col gap-4">
               <div className="space-y-1">
-                <CardTitle>Create tool</CardTitle>
+                <CardTitle>{editingToolId ? 'Edit tool' : 'Create tool'}</CardTitle>
                 <CardDescription>Define protocol metadata and schemas.</CardDescription>
               </div>
+              {editingToolId ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+                  <span>Editing: {editingToolId}</span>
+                  <Button size="sm" variant="outline" onClick={resetToolEditor}>
+                    Clear editor
+                  </Button>
+                </div>
+              ) : null}
               <Input
                 placeholder="Name"
                 value={toolName}
@@ -460,7 +754,26 @@ export default function ToolsPage() {
                 value={toolSchema}
                 onChange={(event) => setToolSchema(event.target.value)}
               />
-              <Button onClick={createTool}>Create tool</Button>
+              <p className="text-xs text-muted">Config JSON (adapter settings).</p>
+              <Textarea
+                className="min-h-[120px] font-mono text-xs"
+                value={toolConfig}
+                onChange={(event) => setToolConfig(event.target.value)}
+                placeholder='{"adapterId":"external.http","url":"https://example.com/tools/lookup"}'
+              />
+              <p className="text-xs text-muted">Auth JSON (scheme + secretRef).</p>
+              <Textarea
+                className="min-h-[96px] font-mono text-xs"
+                value={toolAuth}
+                onChange={(event) => setToolAuth(event.target.value)}
+                placeholder='{"scheme":"apiKey","secretRef":"CRM_TOOL_API_KEY"}'
+              />
+              <div className="flex flex-wrap items-center gap-3">
+                <Button onClick={createTool}>Create tool</Button>
+                <Button variant="outline" onClick={updateTool} disabled={!editingToolId}>
+                  Update tool
+                </Button>
+              </div>
             </div>
           </Card>
         </section>

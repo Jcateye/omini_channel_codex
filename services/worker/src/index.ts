@@ -10,6 +10,9 @@ import {
   registerKnowledgeSyncWorker,
   startKnowledgeSyncScheduler,
 } from './handlers/knowledge-sync.js';
+import { registerJourneyRunsWorker } from './handlers/journey-runs.js';
+import { startJourneyScheduler } from './handlers/journey-scheduler.js';
+import { registerAiInsightsWorker, startAiInsightsScheduler } from './handlers/ai-insights.js';
 
 const inboundWorker = registerInboundEventsWorker();
 const agentRepliesWorker = registerAgentRepliesWorker();
@@ -22,6 +25,10 @@ const analyticsWorker = registerAnalyticsMetricsWorker();
 const analyticsScheduler = startAnalyticsScheduler();
 const knowledgeWorker = registerKnowledgeSyncWorker();
 const knowledgeScheduler = startKnowledgeSyncScheduler();
+const journeyWorker = registerJourneyRunsWorker();
+const journeyScheduler = startJourneyScheduler();
+const aiInsightsWorker = registerAiInsightsWorker();
+const aiInsightsScheduler = startAiInsightsScheduler();
 
 inboundWorker.getBullWorker()?.on('completed', (job) => {
   console.log(`Inbound job ${job.id} completed`);
@@ -79,6 +86,22 @@ knowledgeWorker.getBullWorker()?.on('failed', (job, err) => {
   console.error(`Knowledge job ${job?.id ?? 'unknown'} failed`, err);
 });
 
+journeyWorker.getBullWorker()?.on('completed', (job) => {
+  console.log(`Journey job ${job.id} completed`);
+});
+
+journeyWorker.getBullWorker()?.on('failed', (job, err) => {
+  console.error(`Journey job ${job?.id ?? 'unknown'} failed`, err);
+});
+
+aiInsightsWorker.getBullWorker()?.on('completed', (job) => {
+  console.log(`AI insights job ${job.id} completed`);
+});
+
+aiInsightsWorker.getBullWorker()?.on('failed', (job, err) => {
+  console.error(`AI insights job ${job?.id ?? 'unknown'} failed`, err);
+});
+
 campaignWorker.getBullWorker()?.on('completed', (job) => {
   console.log(`Campaign job ${job.id} completed`);
 });
@@ -90,5 +113,7 @@ campaignWorker.getBullWorker()?.on('failed', (job, err) => {
 console.log(`Campaign scheduler running every ${campaignScheduler.intervalMs}ms`);
 console.log(`Analytics scheduler running every ${analyticsScheduler.intervalMs}ms`);
 console.log(`Knowledge sync scheduler running every ${knowledgeScheduler.intervalMs}ms`);
+console.log(`Journey scheduler running every ${journeyScheduler.intervalMs}ms`);
+console.log(`AI insights scheduler running every ${aiInsightsScheduler.intervalMs}ms`);
 
 console.log('Worker listening for jobs');
