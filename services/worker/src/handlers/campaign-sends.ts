@@ -1,5 +1,4 @@
-import { Prisma } from '@prisma/client';
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 
 export type CampaignSendJob = {

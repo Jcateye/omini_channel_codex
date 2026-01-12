@@ -8,13 +8,24 @@ const buildQueueConfig = (): QueueConnectionConfig => {
 
   const port = process.env.REDIS_PORT ? Number(process.env.REDIS_PORT) : undefined;
   const db = process.env.REDIS_DB ? Number(process.env.REDIS_DB) : undefined;
+  const config: QueueConnectionConfig = {};
+  const host = process.env.REDIS_HOST;
+  const password = process.env.REDIS_PASSWORD;
 
-  return {
-    host: process.env.REDIS_HOST,
-    port: Number.isFinite(port) ? port : undefined,
-    password: process.env.REDIS_PASSWORD,
-    db: Number.isFinite(db) ? db : undefined,
-  };
+  if (typeof host === 'string' && host.length > 0) {
+    config.host = host;
+  }
+  if (typeof port === 'number' && Number.isFinite(port)) {
+    config.port = port;
+  }
+  if (typeof password === 'string' && password.length > 0) {
+    config.password = password;
+  }
+  if (typeof db === 'number' && Number.isFinite(db)) {
+    config.db = db;
+  }
+
+  return config;
 };
 
 const queueFactory = getQueueFactory(buildQueueConfig());

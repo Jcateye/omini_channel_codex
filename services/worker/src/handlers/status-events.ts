@@ -1,4 +1,4 @@
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createWorker, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter, type StatusEvent } from '@omini/whatsapp-bsp';
 
@@ -35,15 +35,21 @@ const mergeStatusPayload = (existing: unknown, update: StatusEvent) => {
       ? (existing as Record<string, unknown>)
       : {};
 
+  const statusUpdate: Record<string, unknown> = {
+    status: update.status,
+    providerMessageId: update.providerMessageId,
+    payload: update.rawPayload,
+  };
+  if (update.occurredAt) {
+    statusUpdate.occurredAt = update.occurredAt.toISOString();
+  }
+  if (update.errorMessage) {
+    statusUpdate.errorMessage = update.errorMessage;
+  }
+
   return {
     ...base,
-    statusUpdate: {
-      status: update.status,
-      providerMessageId: update.providerMessageId,
-      occurredAt: update.occurredAt ? update.occurredAt.toISOString() : undefined,
-      errorMessage: update.errorMessage,
-      payload: update.rawPayload,
-    },
+    statusUpdate,
   };
 };
 
@@ -101,7 +107,7 @@ export const registerStatusEventsWorker = () =>
       where: { id: message.id },
       data: {
         status: nextStatus,
-        rawPayload: mergeStatusPayload(message.rawPayload, statusEvent),
+        rawPayload: mergeStatusPayload(message.rawPayload, statusEvent) as Prisma.InputJsonValue,
       },
     });
   });

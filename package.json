@@ -19,6 +19,7 @@
     "db:push": "pnpm --filter @omini/database db:push"
   },
   "devDependencies": {
+    "@types/node": "^20.11.30",
     "turbo": "^2.0.0",
     "typescript": "^5.3.0"
   },

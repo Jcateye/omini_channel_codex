@@ -23,5 +23,5 @@ export const tenantAuth = async (c: Context<{ Variables: TenantVariables }>, nex
   c.set('tenantId', record.organizationId);
   c.set('apiKeyId', record.id);
 
-  await next();
+  return await next();
 };

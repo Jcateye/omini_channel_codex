@@ -14,6 +14,9 @@ TypeScript monorepo with API, worker, and console.
 - WhatsApp BSP adapters (MessageBird live + mock).
 - Inbound/outbound message flow with lead creation and rules.
 - Campaign scheduling, send status sync, and attribution.
+- Journey orchestration (triggers, delays, branching, tags, webhooks).
+- Real-time AI insights (intent, clusters, suggestions).
+- Multi-touch attribution reports (first/last/linear).
 - CRM webhook integration + mapping validation/preview.
 - Analytics dashboards (delivery/response, lead conversion, ROI, channel compare).
 - Agent routing + tool governance + Langfuse integration.
@@ -34,6 +37,8 @@ Key variables:
 - `BOOTSTRAP_TOKEN`: Admin bootstrap endpoint token.
 - `CAMPAIGN_SCHEDULER_INTERVAL_MS`: Worker scheduler interval.
 - `ANALYTICS_SCHEDULER_INTERVAL_MS`: Worker analytics rollup interval.
+- `JOURNEY_SCHEDULER_INTERVAL_MS`: Journey time trigger poll interval.
+- `AI_INSIGHTS_INTERVAL_MS`: AI insight aggregation interval.
 - `QDRANT_URL`: Qdrant endpoint for vector search.
 - `QDRANT_API_KEY`: Optional Qdrant API key.
 - `QDRANT_COLLECTION`: Qdrant collection name.
@@ -87,6 +92,11 @@ Authorization: Bearer <api_key>
 API_BASE=http://localhost:3100 \
 API_KEY=your_key_here \
 pnpm tsx scripts/mock-flow.ts
+```
+
+## Backfill Attribution
+```bash
+pnpm tsx scripts/backfill-attribution.ts --days=30 --lookback-days=7
 ```
 
 ## Common Ports

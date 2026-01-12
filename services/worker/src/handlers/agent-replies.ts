@@ -1,4 +1,4 @@
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getAgentAdapter, selectAgent, type AgentContext, type AgentRoutingConfig } from '@omini/agent-routing';
 import { Langfuse } from 'langfuse';
@@ -114,14 +114,34 @@ export const registerAgentRepliesWorker = () =>
       return;
     }
 
-    const decision = selectAgent(routingConfig, {
+    const routingContext: {
+      platform: string;
+      provider?: string;
+      stage?: string;
+      source?: string | null;
+      tags?: string[];
+      text?: string;
+    } = {
       platform: data.context.platform,
-      provider: data.context.provider ?? undefined,
-      stage: data.context.stage,
-      source: data.context.source ?? undefined,
-      tags: data.context.tags,
-      text: data.context.text,
-    });
+    };
+
+    if (typeof data.context.provider === 'string') {
+      routingContext.provider = data.context.provider;
+    }
+    if (data.context.stage !== undefined) {
+      routingContext.stage = data.context.stage;
+    }
+    if (data.context.source !== undefined) {
+      routingContext.source = data.context.source;
+    }
+    if (data.context.tags !== undefined) {
+      routingContext.tags = data.context.tags;
+    }
+    if (data.context.text !== undefined) {
+      routingContext.text = data.context.text;
+    }
+
+    const decision = selectAgent(routingConfig, routingContext);
 
     if (!decision.agentId) {
       return;
@@ -137,6 +157,13 @@ export const registerAgentRepliesWorker = () =>
       return;
     }
 
+    const messageContent = {
+      text: response.text,
+      agentId: adapter.id,
+      ruleId: decision.matchedRuleId ?? null,
+      metadata: response.metadata ?? null,
+    } as Prisma.InputJsonValue;
+
     const message = await prisma.message.create({
       data: {
         organizationId: data.context.organizationId,
@@ -147,12 +174,7 @@ export const registerAgentRepliesWorker = () =>
         type: 'text',
         direction: 'outbound',
         status: 'pending',
-        content: {
-          text: response.text,
-          agentId: adapter.id,
-          ruleId: decision.matchedRuleId ?? null,
-          metadata: response.metadata ?? null,
-        },
+        content: messageContent,
       },
     });
 

@@ -151,7 +151,16 @@ export const applyLeadRules = (
       continue;
     }
 
-    matchedRules.push({ id: rule?.id, name: rule?.name });
+    const matchedRule: { id?: string; name?: string } = {};
+    if (typeof rule?.id === 'string') {
+      matchedRule.id = rule.id;
+    }
+    if (typeof rule?.name === 'string') {
+      matchedRule.name = rule.name;
+    }
+    if (matchedRule.id || matchedRule.name) {
+      matchedRules.push(matchedRule);
+    }
 
     const actions = rule?.actions;
     if (!actions) {

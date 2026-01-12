@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import type { Prisma } from '@prisma/client';
+import type { Context } from 'hono';
 
 import { applyLeadRules, type LeadRule } from '@omini/core';
 import type { AgentRoutingConfig, AgentRoutingRule } from '@omini/agent-routing';
@@ -16,7 +16,22 @@ import {
 } from '@omini/agent-tools';
 import { httpExternalAdapter, mockExternalAdapter } from '@omini/agent-tools';
 import { Langfuse } from 'langfuse';
-import { prisma } from '@omini/database';
+import {
+  prisma,
+  Prisma,
+  type AgentRunType,
+  type AttributionModel,
+  type CampaignOptimizationStatus,
+  type CampaignStatus,
+  type JourneyNodeType,
+  type JourneyStatus,
+  type JourneyTriggerType,
+  type KnowledgeSourceType,
+  type LeadStage,
+  type MessageStatus,
+  type Platform,
+  type WebhookDeliveryStatus,
+} from '@omini/database';
 import { createQueue, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter } from '@omini/whatsapp-bsp';
 
@@ -49,12 +64,26 @@ const supportedPlatforms = new Set(['whatsapp', 'twitter', 'instagram', 'tiktok'
 const webhookStatuses = new Set(['pending', 'success', 'failed']);
 const messageStatuses = new Set(['pending', 'sent', 'delivered', 'read', 'failed']);
 const campaignStatuses = new Set(['draft', 'scheduled', 'running', 'completed', 'failed', 'canceled']);
+const campaignOptimizationStatuses = new Set(['pending', 'applied', 'dismissed']);
+const agentRunTypes = new Set(['lead_scoring', 'campaign_optimization']);
 const journeyStatuses = new Set(['draft', 'active', 'paused', 'archived']);
 const journeyTriggerTypes = new Set(['inbound_message', 'tag_change', 'stage_change', 'time']);
 const journeyNodeTypes = new Set(['send_message', 'delay', 'condition', 'tag_update', 'webhook']);
 const attributionModels = new Set(['first_touch', 'last_touch', 'linear']);
 
 const createTrackingToken = () => crypto.randomBytes(16).toString('hex');
+
+const readJsonBody = async (c: Context) => {
+  const parsed = await c.req.json<unknown>().catch(() => ({}));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {} as Record<string, unknown>;
+  }
+  return parsed as Record<string, unknown>;
+};
+
+const toInputJson = (value: unknown) => value as Prisma.InputJsonValue;
+const toNullableJson = (value: unknown) =>
+  value == null ? Prisma.DbNull : (value as Prisma.InputJsonValue);
 
 const loadOrganizationSettings = async (organizationId: string) => {
   const organization = await prisma.organization.findUnique({
@@ -76,10 +105,11 @@ const getAgentRoutingConfig = (settings: Record<string, unknown>): AgentRoutingC
     ? (config.rules.filter((rule) => rule && typeof rule === 'object') as AgentRoutingRule[])
     : [];
 
-  return {
-    defaultAgentId: typeof config.defaultAgentId === 'string' ? config.defaultAgentId : undefined,
-    rules,
-  };
+  const output: AgentRoutingConfig = { rules };
+  if (typeof config.defaultAgentId === 'string') {
+    output.defaultAgentId = config.defaultAgentId;
+  }
+  return output;
 };
 
 const normalizeAgentRoutingConfig = (input: unknown): AgentRoutingConfig => {
@@ -92,10 +122,11 @@ const normalizeAgentRoutingConfig = (input: unknown): AgentRoutingConfig => {
     ? (config.rules.filter((rule) => rule && typeof rule === 'object') as AgentRoutingRule[])
     : [];
 
-  return {
-    defaultAgentId: typeof config.defaultAgentId === 'string' ? config.defaultAgentId : undefined,
-    rules,
-  };
+  const output: AgentRoutingConfig = { rules };
+  if (typeof config.defaultAgentId === 'string') {
+    output.defaultAgentId = config.defaultAgentId;
+  }
+  return output;
 };
 
 const getLeadRulesFromSettings = (settings: Record<string, unknown>): LeadRule[] => {
@@ -171,9 +202,9 @@ const enqueueJourneySignal = async (input: {
   );
 };
 
-const normalizeJourneyStatus = (input: unknown) => {
+const normalizeJourneyStatus = (input: unknown): JourneyStatus => {
   const value = typeof input === 'string' ? input.trim() : '';
-  return journeyStatuses.has(value) ? value : 'draft';
+  return journeyStatuses.has(value) ? (value as JourneyStatus) : 'draft';
 };
 
 const normalizeJourneyTriggers = (input: unknown) => {
@@ -464,8 +495,8 @@ const normalizeDistributionStrategies = (input: unknown) => {
   const defaults = {
     mode: 'round_robin',
     targets: [
-      { id: 'sales', name: 'Sales', weight: 1, skills: ['sales'] },
-      { id: 'support', name: 'Support', weight: 1, skills: ['support'] },
+      { id: 'sales', name: 'Sales', weight: 1, skills: ['sales'], stages: [] },
+      { id: 'support', name: 'Support', weight: 1, skills: ['support'], stages: [] },
     ],
     state: { cursor: 0 },
   };
@@ -513,6 +544,13 @@ const normalizeDistributionStrategies = (input: unknown) => {
 };
 
 const normalizeAgentHandoffConfig = (input: unknown) => {
+  const defaultStageRoles: Record<string, string> = {
+    new: 'ops',
+    qualified: 'sales',
+    nurtured: 'sales',
+    converted: 'ops',
+    lost: 'support',
+  };
   const defaults = {
     enabled: true,
     roles: [
@@ -520,13 +558,7 @@ const normalizeAgentHandoffConfig = (input: unknown) => {
       { id: 'support', name: 'Support' },
       { id: 'ops', name: 'Ops' },
     ],
-    stageRoles: {
-      new: 'ops',
-      qualified: 'sales',
-      nurtured: 'sales',
-      converted: 'ops',
-      lost: 'support',
-    },
+    stageRoles: defaultStageRoles,
     rules: [
       { id: 'score_sales', type: 'score', minScore: 50, targetRole: 'sales', enabled: true },
       { id: 'tag_support', type: 'tag', tagsAny: ['complaint', 'refund'], targetRole: 'support', enabled: true },
@@ -1115,8 +1147,8 @@ const createAgentMemory = async (input: {
       leadId: input.leadId ?? null,
       sessionId: input.sessionId ?? null,
       key: input.key ?? null,
-      content: input.content,
-      metadata: input.metadata ?? null,
+      content: toInputJson(input.content),
+      ...(input.metadata ? { metadata: toInputJson(input.metadata) } : {}),
       expiresAt: buildExpiresAt(input.retentionDays),
     },
   });
@@ -1197,7 +1229,7 @@ const retrieveKnowledgeChunksVector = async (input: KnowledgeQueryInput) => {
       vector,
       topK,
       organizationId: input.organizationId,
-      sourceIds: input.sourceIds,
+      ...(input.sourceIds && input.sourceIds.length > 0 ? { sourceIds: input.sourceIds } : {}),
     });
 
     if (hits.length === 0) {
@@ -1233,10 +1265,7 @@ const retrieveKnowledgeChunksVector = async (input: KnowledgeQueryInput) => {
           metadata: chunk.metadata,
         };
       })
-      .filter(
-        (item): item is { id: string; sourceId: string; content: string; score: number; metadata: Prisma.JsonValue | null | undefined } =>
-          !!item
-      );
+      .filter((item): item is NonNullable<typeof item> => item !== null);
 
     return ordered;
   } catch (error) {
@@ -1441,12 +1470,22 @@ const applyLeadUpdate = async (
   }
 
   const conversionUpdates = applyConversionUpdate(lead.stage, normalized);
+  const data: Prisma.LeadUpdateInput = {
+    ...conversionUpdates,
+    lastActivityAt: new Date(),
+  };
+  if ('metadata' in conversionUpdates) {
+    data.metadata = toNullableJson(
+      conversionUpdates.metadata &&
+        typeof conversionUpdates.metadata === 'object' &&
+        !Array.isArray(conversionUpdates.metadata)
+        ? conversionUpdates.metadata
+        : null
+    );
+  }
   return prisma.lead.update({
     where: { id: lead.id },
-    data: {
-      ...conversionUpdates,
-      lastActivityAt: new Date(),
-    },
+    data,
   });
 };
 
@@ -1587,10 +1626,10 @@ const runLeadAgentWorkflow = async (input: {
       organizationId: input.organizationId,
       type: 'lead_scoring',
       leadId: lead.id,
-      input: {
+      input: toInputJson({
         text: input.text ?? null,
         signals: input.signals ?? [],
-      },
+      }),
     },
   });
 
@@ -1599,6 +1638,12 @@ const runLeadAgentWorkflow = async (input: {
     leadId: lead.id,
     sessionId: input.sessionId ?? null,
   });
+  const memoryInputs = memories.map((memory) => ({
+    content:
+      memory.content && typeof memory.content === 'object' && !Array.isArray(memory.content)
+        ? (memory.content as Record<string, unknown>)
+        : {},
+  }));
 
   await prisma.agentRunStep.create({
     data: {
@@ -1606,8 +1651,11 @@ const runLeadAgentWorkflow = async (input: {
       stepIndex: 0,
       stepType: 'memory',
       status: 'completed',
-      input: { leadId: lead.id, sessionId: input.sessionId ?? null },
-      output: { count: memories.length, memoryIds: memories.map((memory) => memory.id) },
+      input: toInputJson({ leadId: lead.id, sessionId: input.sessionId ?? null }),
+      output: toInputJson({
+        count: memories.length,
+        memoryIds: memories.map((memory) => memory.id),
+      }),
       finishedAt: new Date(),
     },
   });
@@ -1617,6 +1665,7 @@ const runLeadAgentWorkflow = async (input: {
     query: input.text ?? input.signals?.join(' ') ?? '',
     topK: 5,
   });
+  const knowledgeInputs = knowledge.map((chunk) => ({ content: chunk.content }));
 
   await prisma.agentRunStep.create({
     data: {
@@ -1624,8 +1673,11 @@ const runLeadAgentWorkflow = async (input: {
       stepIndex: 1,
       stepType: 'retrieval',
       status: 'completed',
-      input: { query: input.text ?? input.signals ?? [] },
-      output: { count: knowledge.length, chunkIds: knowledge.map((chunk) => chunk.id) },
+      input: toInputJson({ query: input.text ?? input.signals ?? [] }),
+      output: toInputJson({
+        count: knowledge.length,
+        chunkIds: knowledge.map((chunk) => chunk.id),
+      }),
       finishedAt: new Date(),
     },
   });
@@ -1641,10 +1693,10 @@ const runLeadAgentWorkflow = async (input: {
           ? (lead.metadata as Record<string, unknown>)
           : null,
     },
-    text: input.text,
-    signals: input.signals,
-    memories,
-    knowledge,
+    memories: memoryInputs,
+    knowledge: knowledgeInputs,
+    ...(input.text ? { text: input.text } : {}),
+    ...(input.signals && input.signals.length > 0 ? { signals: input.signals } : {}),
   });
 
   const derivedStage =
@@ -1679,13 +1731,13 @@ const runLeadAgentWorkflow = async (input: {
     await prisma.organization.update({
       where: { id: input.organizationId },
       data: {
-        settings: {
+        settings: toInputJson({
           ...settings,
           agentStrategies: {
             ...agentStrategies,
             distribution: updatedDistribution,
           },
-        },
+        }),
       },
     });
   }
@@ -1696,15 +1748,15 @@ const runLeadAgentWorkflow = async (input: {
       stepIndex: 2,
       stepType: 'tool',
       status: 'completed',
-      input: {
+      input: toInputJson({
         toolId: 'internal.lead_scoring',
         signals: input.signals ?? [],
         text: input.text ?? null,
-      },
-      output: {
+      }),
+      output: toInputJson({
         updates: decision.updates,
         rationale: decision.rationale,
-      },
+      }),
       finishedAt: new Date(),
     },
   });
@@ -1712,21 +1764,21 @@ const runLeadAgentWorkflow = async (input: {
   if (distributionDecision.target) {
     await prisma.agentRunStep.create({
       data: {
-        runId: run.id,
-        stepIndex: 3,
-        stepType: 'distribution',
-        status: 'completed',
-        input: {
-          assignmentQueue: distributionDecision.target.id,
-          strategy: distributionSettings.mode,
-          rationale: distributionDecision.rationale,
-        },
-        output: {
-          assigned: true,
-        },
-        finishedAt: new Date(),
-      },
-    });
+      runId: run.id,
+      stepIndex: 3,
+      stepType: 'distribution',
+      status: 'completed',
+      input: toInputJson({
+        assignmentQueue: distributionDecision.target.id,
+        strategy: distributionSettings.mode,
+        rationale: distributionDecision.rationale,
+      }),
+      output: toInputJson({
+        assigned: true,
+      }),
+      finishedAt: new Date(),
+    },
+  });
   }
 
   let updatedLead = lead;
@@ -1799,10 +1851,10 @@ const runLeadAgentWorkflow = async (input: {
         targetId: distributionDecision.target.id,
         targetType: 'queue',
         targetName: distributionDecision.target.name ?? null,
-        rationale: { reasons: distributionDecision.rationale },
-        metadata: {
+        rationale: toNullableJson({ reasons: distributionDecision.rationale }),
+        metadata: toNullableJson({
           suggestedQueue: decision.assignmentQueue ?? null,
-        },
+        }),
       },
     });
   }
@@ -1835,8 +1887,8 @@ const runLeadAgentWorkflow = async (input: {
         toRole: handoffDecision.nextRole,
         triggerType: handoffDecision.trigger?.type ?? 'unknown',
         triggerRuleId: handoffDecision.trigger?.ruleId ?? null,
-        triggerDetail: handoffDecision.trigger?.detail ?? null,
-        contextShared: sharedContext,
+        triggerDetail: toNullableJson(handoffDecision.trigger?.detail ?? null),
+        contextShared: toNullableJson(sharedContext),
       },
     });
   }
@@ -1874,12 +1926,12 @@ const runLeadAgentWorkflow = async (input: {
     where: { id: run.id },
     data: {
       status: 'completed',
-      output: {
+      output: toInputJson({
         updates: mergedUpdates,
         rationale: decision.rationale,
         assignmentQueue: distributionDecision.target?.id ?? null,
         handoffRole: handoffDecision.nextRole ?? null,
-      },
+      }),
     },
   });
 
@@ -2010,7 +2062,7 @@ const buildSegmentWhere = (
   const where: Prisma.LeadWhereInput = {
     organizationId,
     ...(segment.stages.length > 0
-      ? { stage: { in: segment.stages as Prisma.LeadStage[] } }
+      ? { stage: { in: segment.stages as LeadStage[] } }
       : {}),
     ...(segment.tagsAll.length > 0 ? { tags: { hasEvery: segment.tagsAll } } : {}),
     ...(segment.sources.length > 0 ? { source: { in: segment.sources } } : {}),
@@ -2156,11 +2208,11 @@ const enqueueCrmWebhook = async (
 
 const findOrCreateContact = async (input: {
   organizationId: string;
-  platform: string;
+  platform: Platform;
   externalId: string;
   name?: string;
 }) => {
-  const identifier = await prisma.contactIdentifier.findUnique({
+  const identifier = (await prisma.contactIdentifier.findUnique({
     where: {
       organizationId_platform_externalId: {
         organizationId: input.organizationId,
@@ -2169,7 +2221,9 @@ const findOrCreateContact = async (input: {
       },
     },
     include: { contact: true },
-  });
+  })) as Prisma.ContactIdentifierGetPayload<{
+    include: { contact: true };
+  }> | null;
 
   if (identifier?.contact) {
     if (input.name && !identifier.contact.name) {
@@ -2185,8 +2239,8 @@ const findOrCreateContact = async (input: {
   return prisma.contact.create({
     data: {
       organizationId: input.organizationId,
-      name: input.name,
-      phone: input.platform === 'whatsapp' ? input.externalId : undefined,
+      ...(input.name ? { name: input.name } : {}),
+      ...(input.platform === 'whatsapp' ? { phone: input.externalId } : {}),
       identifiers: {
         create: {
           organization: { connect: { id: input.organizationId } },
@@ -2203,7 +2257,7 @@ const upsertConversation = async (input: {
   organizationId: string;
   channelId: string;
   contactId: string;
-  platform: string;
+  platform: Platform;
   externalId: string;
 }) => {
   return prisma.conversation.upsert({
@@ -2421,10 +2475,10 @@ api.put('/v1/lead-rules', async (c) => {
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         leadRules,
-      },
+      }),
     },
   });
 
@@ -2439,17 +2493,17 @@ api.get('/v1/agent-routing', async (c) => {
 });
 
 api.put('/v1/agent-routing', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const config = normalizeAgentRoutingConfig(body);
 
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         agentRouting: config,
-      },
+      }),
     },
   });
 
@@ -2457,18 +2511,26 @@ api.put('/v1/agent-routing', async (c) => {
 });
 
 api.post('/v1/agent-routing/test', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   const config = getAgentRoutingConfig(settings);
 
-  const decision = selectAgent(config, {
-    platform: typeof body.platform === 'string' ? body.platform : undefined,
-    provider: typeof body.provider === 'string' ? body.provider : undefined,
-    stage: typeof body.stage === 'string' ? body.stage : undefined,
-    source: typeof body.source === 'string' ? body.source : undefined,
-    tags: Array.isArray(body.tags) ? (body.tags as string[]) : undefined,
-    text: typeof body.text === 'string' ? body.text : undefined,
-  });
+  const input: {
+    platform?: string;
+    provider?: string;
+    stage?: string;
+    source?: string | null;
+    tags?: string[];
+    text?: string;
+  } = {};
+  if (typeof body.platform === 'string') input.platform = body.platform;
+  if (typeof body.provider === 'string') input.provider = body.provider;
+  if (typeof body.stage === 'string') input.stage = body.stage;
+  if (typeof body.source === 'string') input.source = body.source;
+  if (Array.isArray(body.tags)) input.tags = body.tags as string[];
+  if (typeof body.text === 'string') input.text = body.text;
+
+  const decision = selectAgent(config, input);
 
   return c.json({ decision });
 });
@@ -2481,7 +2543,7 @@ api.get('/v1/agent/settings', async (c) => {
 });
 
 api.put('/v1/agent/settings', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const agentSettings = normalizeAgentIntelligenceSettings(
     (body.agentIntelligence as Record<string, unknown>) ?? body
   );
@@ -2490,10 +2552,10 @@ api.put('/v1/agent/settings', async (c) => {
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         agentIntelligence: agentSettings,
-      },
+      }),
     },
   });
 
@@ -2513,7 +2575,7 @@ api.get('/v1/agent/strategies', async (c) => {
 });
 
 api.put('/v1/agent/strategies', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const payload = (body.strategies as Record<string, unknown>) ?? body;
 
   const optimization = normalizeOptimizationStrategies(payload.optimization);
@@ -2523,13 +2585,13 @@ api.put('/v1/agent/strategies', async (c) => {
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         agentStrategies: {
           optimization,
           distribution,
         },
-      },
+      }),
     },
   });
 
@@ -2544,17 +2606,17 @@ api.get('/v1/agent/handoffs', async (c) => {
 });
 
 api.put('/v1/agent/handoffs', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const config = normalizeAgentHandoffConfig(body.config ?? body);
 
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         agentHandoffs: config,
-      },
+      }),
     },
   });
 
@@ -2562,7 +2624,7 @@ api.put('/v1/agent/handoffs', async (c) => {
 });
 
 api.post('/v1/agent/handoffs/preview', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const leadId = typeof body.leadId === 'string' ? body.leadId : null;
   const stage = typeof body.stage === 'string' ? body.stage : 'new';
   const score = typeof body.score === 'number' ? body.score : null;
@@ -2666,7 +2728,7 @@ api.get('/v1/agent/handoffs/logs', async (c) => {
 });
 
 api.post('/v1/agent/distribution/preview', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const leadId = typeof body.leadId === 'string' ? body.leadId : null;
   const stage = typeof body.stage === 'string' ? body.stage : 'new';
   const tags = Array.isArray(body.tags)
@@ -2775,14 +2837,15 @@ api.get('/v1/knowledge-sources', async (c) => {
 });
 
 api.post('/v1/knowledge-sources', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const description = typeof body.description === 'string' ? body.description.trim() : null;
   const kindRaw = typeof body.kind === 'string' ? body.kind.trim() : '';
   const normalizedKind = kindRaw === 'text' ? 'manual' : kindRaw;
-  const kind = ['manual', 'web', 'notion', 'google_docs'].includes(normalizedKind)
+  const kindValue = ['manual', 'web', 'notion', 'google_docs'].includes(normalizedKind)
     ? normalizedKind
     : 'manual';
+  const kind = kindValue as KnowledgeSourceType;
   const config =
     body.config && typeof body.config === 'object' && !Array.isArray(body.config)
       ? (body.config as Record<string, unknown>)
@@ -2798,7 +2861,7 @@ api.post('/v1/knowledge-sources', async (c) => {
       name,
       description,
       kind,
-      config,
+      ...(config ? { config: toInputJson(config) } : {}),
     },
   });
 
@@ -2806,7 +2869,7 @@ api.post('/v1/knowledge-sources', async (c) => {
 });
 
 api.put('/v1/knowledge-sources/:id', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const source = await prisma.knowledgeSource.findFirst({
     where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
   });
@@ -2833,15 +2896,15 @@ api.put('/v1/knowledge-sources/:id', async (c) => {
     if (!['manual', 'web', 'notion', 'google_docs'].includes(normalizedKind)) {
       return c.json({ error: 'invalid_kind' }, 400);
     }
-    updates.kind = normalizedKind;
+    updates.kind = normalizedKind as KnowledgeSourceType;
   }
   if (typeof body.enabled === 'boolean') {
     updates.enabled = body.enabled;
   }
   if (body.config === null) {
-    updates.config = null;
+    updates.config = Prisma.DbNull;
   } else if (body.config && typeof body.config === 'object' && !Array.isArray(body.config)) {
-    updates.config = body.config as Record<string, unknown>;
+    updates.config = toInputJson(body.config);
   }
 
   const updated = await prisma.knowledgeSource.update({
@@ -2853,7 +2916,7 @@ api.put('/v1/knowledge-sources/:id', async (c) => {
 });
 
 api.post('/v1/knowledge-sources/:id/chunks', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const content = typeof body.content === 'string' ? body.content.trim() : '';
   const chunkSize =
     typeof body.chunkSize === 'number' && body.chunkSize > 0 ? Math.floor(body.chunkSize) : 600;
@@ -2919,7 +2982,7 @@ api.post('/v1/knowledge-sources/:id/sync', async (c) => {
       organizationId: c.get('tenantId'),
       sourceId: source.id,
       status: 'pending',
-      metadata: { trigger: 'manual' },
+      metadata: toInputJson({ trigger: 'manual' }),
     },
   });
 
@@ -2954,7 +3017,7 @@ api.get('/v1/knowledge-sources/:id/syncs', async (c) => {
 });
 
 api.post('/v1/knowledge/retrieve', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const query = typeof body.query === 'string' ? body.query : '';
   const topK = typeof body.topK === 'number' && body.topK > 0 ? Math.floor(body.topK) : 5;
   const sourceIds = Array.isArray(body.sourceIds)
@@ -2984,9 +3047,9 @@ api.post('/v1/knowledge/retrieve', async (c) => {
     organizationId: c.get('tenantId'),
     query,
     topK,
-    sourceIds,
-    tags,
-    minCreatedAt,
+    ...(sourceIds && sourceIds.length > 0 ? { sourceIds } : {}),
+    ...(tags && tags.length > 0 ? { tags } : {}),
+    ...(minCreatedAt ? { minCreatedAt } : {}),
   });
 
   return c.json({ results });
@@ -3199,17 +3262,17 @@ api.get('/v1/analytics/settings', async (c) => {
 });
 
 api.put('/v1/analytics/settings', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const analytics = normalizeAnalyticsSettings(body.analytics ?? body);
 
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         analytics,
-      },
+      }),
     },
   });
 
@@ -3508,7 +3571,7 @@ api.get('/v1/attribution/report', async (c) => {
   const touchpoints = await prisma.attributionTouchpoint.findMany({
     where: {
       organizationId: c.get('tenantId'),
-      model: model as Prisma.AttributionModel,
+      model: model as AttributionModel,
       touchedAt: { gte: start, lt: end },
     },
   });
@@ -3516,7 +3579,7 @@ api.get('/v1/attribution/report', async (c) => {
   const sumBy = <T extends { weight: number }>(items: T[]) =>
     items.reduce((total, item) => total + item.weight, 0);
 
-  const groupBy = <T extends { key: string | null }>(items: T[]) => {
+  const groupBy = <T extends { key: string | null; weight: number }>(items: T[]) => {
     const map = new Map<string, number>();
     for (const item of items) {
       if (!item.key) continue;
@@ -3584,8 +3647,12 @@ api.get('/v1/attribution/report', async (c) => {
 });
 
 api.get('/v1/agent/optimizations', async (c) => {
-  const status = c.req.query('status');
+  const statusRaw = c.req.query('status');
   const campaignId = c.req.query('campaignId');
+  const status =
+    typeof statusRaw === 'string' && campaignOptimizationStatuses.has(statusRaw)
+      ? (statusRaw as CampaignOptimizationStatus)
+      : undefined;
 
   const where: Prisma.CampaignOptimizationWhereInput = {
     organizationId: c.get('tenantId'),
@@ -3638,7 +3705,7 @@ api.post('/v1/agent/optimizations/:id/apply', async (c) => {
   await prisma.campaign.update({
     where: { id: optimization.campaignId },
     data: {
-      metadata: campaignMetadata,
+      metadata: toInputJson(campaignMetadata),
     },
   });
 
@@ -3677,9 +3744,13 @@ api.post('/v1/agent/optimizations/:id/dismiss', async (c) => {
 });
 
 api.get('/v1/agent/runs', async (c) => {
-  const type = c.req.query('type');
+  const typeRaw = c.req.query('type');
   const leadId = c.req.query('leadId');
   const campaignId = c.req.query('campaignId');
+  const type =
+    typeof typeRaw === 'string' && agentRunTypes.has(typeRaw)
+      ? (typeRaw as AgentRunType)
+      : undefined;
 
   const where: Prisma.AgentRunWhereInput = {
     organizationId: c.get('tenantId'),
@@ -3724,7 +3795,7 @@ api.get('/v1/agent-tools', async (c) => {
 });
 
 api.post('/v1/agent-tools', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const normalized = normalizeToolDefinitionInput(body);
 
   if (!normalized.name || !normalized.version) {
@@ -3740,9 +3811,9 @@ api.post('/v1/agent-tools', async (c) => {
       provider: normalized.provider,
       description: normalized.description,
       protocol: normalized.protocol,
-      schema: normalized.schema,
-      config: normalized.config,
-      auth: normalized.auth,
+      schema: toInputJson(normalized.schema),
+      ...(normalized.config ? { config: toInputJson(normalized.config) } : {}),
+      ...(normalized.auth ? { auth: toInputJson(normalized.auth) } : {}),
       enabled: normalized.enabled,
     },
   });
@@ -3751,7 +3822,7 @@ api.post('/v1/agent-tools', async (c) => {
 });
 
 api.put('/v1/agent-tools/:id', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const normalized = normalizeToolDefinitionInput(body);
 
   const tool = await prisma.toolDefinition.findFirst({
@@ -3771,9 +3842,9 @@ api.put('/v1/agent-tools/:id', async (c) => {
       provider: normalized.provider,
       description: normalized.description,
       protocol: normalized.protocol,
-      schema: normalized.schema,
-      config: normalized.config,
-      auth: normalized.auth,
+      schema: toInputJson(normalized.schema),
+      config: normalized.config ? toInputJson(normalized.config) : Prisma.DbNull,
+      auth: normalized.auth ? toInputJson(normalized.auth) : Prisma.DbNull,
       enabled: normalized.enabled,
     },
   });
@@ -3782,7 +3853,7 @@ api.put('/v1/agent-tools/:id', async (c) => {
 });
 
 api.post('/v1/agent-tools/:id/execute', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const tool = await prisma.toolDefinition.findFirst({
     where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
   });
@@ -3809,8 +3880,8 @@ api.post('/v1/agent-tools/:id/execute', async (c) => {
         toolId: tool.id,
         agentId,
         status: 'denied',
-        requestPayload: { inputs, context },
-        responsePayload: null,
+        requestPayload: toInputJson({ inputs, context }),
+        responsePayload: toNullableJson(null),
       },
     });
     return c.json({ error: 'tool_access_denied' }, 403);
@@ -3851,8 +3922,8 @@ api.post('/v1/agent-tools/:id/execute', async (c) => {
       status: result.status,
       latencyMs: result.latencyMs ?? null,
       errorMessage: result.error ?? null,
-      requestPayload: { inputs, context },
-      responsePayload: result.outputs ?? null,
+      requestPayload: toInputJson({ inputs, context }),
+      responsePayload: toNullableJson(result.outputs ?? null),
     },
   });
 
@@ -3899,7 +3970,7 @@ api.get('/v1/agent-tools/:id/permissions', async (c) => {
 });
 
 api.put('/v1/agent-tools/:id/permissions', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const tool = await prisma.toolDefinition.findFirst({
     where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
   });
@@ -3910,24 +3981,26 @@ api.put('/v1/agent-tools/:id/permissions', async (c) => {
 
   const normalized = normalizePermissionInput(body);
 
-  const permission = await prisma.toolPermission.upsert({
+  const existing = await prisma.toolPermission.findFirst({
     where: {
-      organizationId_toolId_agentId: {
-        organizationId: c.get('tenantId'),
-        toolId: tool.id,
-        agentId: normalized.agentId,
-      },
-    },
-    update: {
-      allowed: normalized.allowed,
-    },
-    create: {
       organizationId: c.get('tenantId'),
       toolId: tool.id,
       agentId: normalized.agentId,
-      allowed: normalized.allowed,
     },
   });
+  const permission = existing
+    ? await prisma.toolPermission.update({
+        where: { id: existing.id },
+        data: { allowed: normalized.allowed },
+      })
+    : await prisma.toolPermission.create({
+        data: {
+          organizationId: c.get('tenantId'),
+          toolId: tool.id,
+          agentId: normalized.agentId,
+          allowed: normalized.allowed,
+        },
+      });
 
   return c.json({ permission });
 });
@@ -4014,7 +4087,7 @@ api.get('/v1/langfuse', async (c) => {
 });
 
 api.put('/v1/langfuse', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const incoming = normalizeLangfuseSettings(body.langfuse ?? body);
 
   const settings = await loadOrganizationSettings(c.get('tenantId'));
@@ -4030,10 +4103,10 @@ api.put('/v1/langfuse', async (c) => {
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         langfuse,
-      },
+      }),
     },
   });
 
@@ -4098,7 +4171,7 @@ api.get('/v1/prompts/metrics', async (c) => {
 });
 
 api.post('/v1/prompts/:id/usage', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const prompt = await prisma.promptTemplate.findFirst({
     where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
   });
@@ -4123,7 +4196,7 @@ api.post('/v1/prompts/:id/usage', async (c) => {
       agentId,
       outcome,
       latencyMs,
-      metadata,
+      metadata: toNullableJson(metadata),
     },
   });
 
@@ -4150,7 +4223,7 @@ api.post('/v1/prompts/:id/usage', async (c) => {
 });
 
 api.post('/v1/prompts', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const normalized = normalizePromptInput(body);
 
   if (!normalized.name || !normalized.content) {
@@ -4163,7 +4236,7 @@ api.post('/v1/prompts', async (c) => {
       name: normalized.name,
       version: normalized.version,
       content: normalized.content,
-      metadata: normalized.metadata,
+      metadata: toNullableJson(normalized.metadata),
       active: normalized.active,
     },
   });
@@ -4172,7 +4245,7 @@ api.post('/v1/prompts', async (c) => {
 });
 
 api.put('/v1/prompts/:id', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const normalized = normalizePromptInput(body);
 
   const prompt = await prisma.promptTemplate.findFirst({
@@ -4189,7 +4262,7 @@ api.put('/v1/prompts/:id', async (c) => {
       name: normalized.name || prompt.name,
       version: normalized.version || prompt.version,
       content: normalized.content || prompt.content,
-      metadata: normalized.metadata,
+      metadata: toNullableJson(normalized.metadata),
       active: normalized.active,
     },
   });
@@ -4198,7 +4271,7 @@ api.put('/v1/prompts/:id', async (c) => {
 });
 
 api.post('/v1/crm/leads/:id', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const leadId = c.req.param('id');
   const settings = await loadOrganizationSettings(c.get('tenantId'));
   const fieldMapping = normalizeCrmFieldMapping(settings.crmFieldMapping);
@@ -4271,7 +4344,7 @@ api.post('/v1/crm/leads/:id', async (c) => {
 });
 
 api.post('/v1/crm/revenue', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const amount = typeof body.amount === 'number' ? body.amount : NaN;
   const currency = normalizeCurrency(body.currency) ?? 'USD';
   const source = typeof body.source === 'string' ? body.source.trim() : 'crm';
@@ -4331,10 +4404,11 @@ api.post('/v1/crm/revenue', async (c) => {
       source,
       externalId,
       occurredAt,
-      metadata:
+      metadata: toNullableJson(
         body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
           ? (body.metadata as Record<string, unknown>)
-          : null,
+          : null
+      ),
     },
   });
 
@@ -4349,7 +4423,7 @@ api.post('/v1/crm/revenue', async (c) => {
 });
 
 api.put('/v1/campaigns/:id/roi', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const cost = typeof body.cost === 'number' ? body.cost : null;
   const revenue = typeof body.revenue === 'number' ? body.revenue : null;
 
@@ -4418,14 +4492,14 @@ api.get('/v1/crm/mapping/examples', async (c) => {
 });
 
 api.post('/v1/crm/mapping/validate', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const mapping = normalizeCrmFieldMapping(body.mapping ?? body);
   const result = validateCrmFieldMapping(mapping);
   return c.json(result, result.valid ? 200 : 400);
 });
 
 api.post('/v1/crm/mapping/preview', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const mapping = normalizeCrmFieldMapping(body.mapping ?? body);
   const validation = validateCrmFieldMapping(mapping);
   if (!validation.valid) {
@@ -4442,7 +4516,7 @@ api.post('/v1/crm/mapping/preview', async (c) => {
 });
 
 api.put('/v1/crm/mapping', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const mapping = normalizeCrmFieldMapping(body.mapping ?? body);
   const validation = validateCrmFieldMapping(mapping);
 
@@ -4454,10 +4528,10 @@ api.put('/v1/crm/mapping', async (c) => {
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
     data: {
-      settings: {
+      settings: toInputJson({
         ...settings,
         crmFieldMapping: mapping,
-      },
+      }),
     },
   });
 
@@ -4472,7 +4546,7 @@ api.get('/v1/crm/webhook', async (c) => {
 });
 
 api.put('/v1/crm/webhook', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const url = body.url as string | undefined;
 
   if (!url) {
@@ -4480,26 +4554,28 @@ api.put('/v1/crm/webhook', async (c) => {
   }
 
   const settings = await loadOrganizationSettings(c.get('tenantId'));
+  const webhook: Record<string, unknown> = {
+    url,
+    enabled: typeof body.enabled === 'boolean' ? body.enabled : true,
+    mode: body.mode === 'mock' ? 'mock' : 'live',
+  };
+  if (typeof body.secret === 'string') {
+    webhook.secret = body.secret;
+  }
+  if (typeof body.headers === 'object' && body.headers) {
+    webhook.headers = body.headers as Record<string, string>;
+  }
+  if (Array.isArray(body.events)) {
+    webhook.events = (body.events as string[]).filter((event) => typeof event === 'string');
+  }
   const updated = {
     ...settings,
-    crmWebhook: {
-      url,
-      secret: typeof body.secret === 'string' ? body.secret : undefined,
-      enabled: typeof body.enabled === 'boolean' ? body.enabled : true,
-      headers:
-        typeof body.headers === 'object' && body.headers
-          ? (body.headers as Record<string, string>)
-          : undefined,
-      events: Array.isArray(body.events)
-        ? (body.events as string[]).filter((event) => typeof event === 'string')
-        : undefined,
-      mode: body.mode === 'mock' ? 'mock' : 'live',
-    },
+    crmWebhook: webhook,
   };
 
   await prisma.organization.update({
     where: { id: c.get('tenantId') },
-    data: { settings: updated },
+    data: { settings: toInputJson(updated) },
   });
 
   return c.json({ crmWebhook: updated.crmWebhook });
@@ -4535,7 +4611,7 @@ api.get('/v1/leads', async (c) => {
 
   const where: Prisma.LeadWhereInput = {
     organizationId: c.get('tenantId'),
-    ...(stages.length > 0 ? { stage: { in: stages as Prisma.LeadStage[] } } : {}),
+    ...(stages.length > 0 ? { stage: { in: stages as LeadStage[] } } : {}),
     ...(tags.length > 0 ? { tags: { hasSome: tags } } : {}),
   };
 
@@ -4565,7 +4641,7 @@ api.get('/v1/leads', async (c) => {
 });
 
 api.post('/v1/leads/:id/signals', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const signals = normalizeTags(body.signals);
   const text = typeof body.text === 'string' ? body.text : undefined;
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
@@ -4596,6 +4672,10 @@ api.post('/v1/leads/:id/signals', async (c) => {
   let ruleUpdates: Record<string, unknown> = {};
 
   if (leadRules.length > 0) {
+    const leadRuleContext = {
+      signals,
+      ...(text ? { text } : {}),
+    };
     ruleResult = applyLeadRules(
       {
         tags: updatedLead.tags,
@@ -4608,32 +4688,43 @@ api.post('/v1/leads/:id/signals', async (c) => {
             : null,
       },
       leadRules,
-      { text, signals }
+      leadRuleContext
     );
 
     if (Object.keys(ruleResult.updates).length > 0) {
       ruleUpdates = applyConversionUpdate(updatedLead.stage, ruleResult.updates);
+      const leadUpdate: Prisma.LeadUpdateInput = {
+        ...ruleUpdates,
+        lastActivityAt: new Date(),
+      };
+      if ('metadata' in ruleUpdates) {
+        leadUpdate.metadata = toNullableJson(
+          ruleUpdates.metadata &&
+            typeof ruleUpdates.metadata === 'object' &&
+            !Array.isArray(ruleUpdates.metadata)
+            ? ruleUpdates.metadata
+            : null
+        );
+      }
       updatedLead = await prisma.lead.update({
         where: { id: updatedLead.id },
-        data: {
-          ...ruleUpdates,
-          lastActivityAt: new Date(),
-        },
+        data: leadUpdate,
       });
     }
   }
 
+  const matchedRuleIds = ruleResult?.matchedRules
+    ?.map((rule) => rule.id ?? rule.name ?? '')
+    .filter((value) => value.length > 0);
   const agentResult = await runLeadAgentWorkflow({
     organizationId: c.get('tenantId'),
     leadId: updatedLead.id,
-    text,
-    signals,
-    sessionId,
-    matchedRuleIds: ruleResult?.matchedRules
-      ?.map((rule) => rule.id ?? rule.name ?? '')
-      .filter((value) => value.length > 0),
-    taskType,
-    confidence,
+    ...(text ? { text } : {}),
+    ...(signals.length > 0 ? { signals } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(matchedRuleIds && matchedRuleIds.length > 0 ? { matchedRuleIds } : {}),
+    ...(taskType ? { taskType } : {}),
+    ...(typeof confidence === 'number' ? { confidence } : {}),
   });
 
   if (agentResult.lead) {
@@ -4676,7 +4767,7 @@ api.post('/v1/leads/:id/signals', async (c) => {
       triggerType: 'tag_change',
       tags: updatedLead.tags ?? [],
       stage: updatedLead.stage,
-      text,
+      ...(text ? { text } : {}),
     });
   }
 
@@ -4687,7 +4778,7 @@ api.post('/v1/leads/:id/signals', async (c) => {
       triggerType: 'stage_change',
       tags: updatedLead.tags ?? [],
       stage: updatedLead.stage,
-      text,
+      ...(text ? { text } : {}),
     });
   }
 
@@ -4707,7 +4798,7 @@ api.post('/v1/leads/:id/signals', async (c) => {
 });
 
 api.post('/v1/agent/leads/:id/score', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const signals = normalizeTags(body.signals);
   const text = typeof body.text === 'string' ? body.text : undefined;
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
@@ -4733,14 +4824,14 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
   const agentResult = await runLeadAgentWorkflow({
     organizationId: c.get('tenantId'),
     leadId: lead.id,
-    text,
-    signals,
-    sessionId,
-    matchedRuleIds: Array.isArray(body.matchedRuleIds)
-      ? body.matchedRuleIds.filter((value) => typeof value === 'string')
-      : undefined,
-    taskType,
-    confidence,
+    ...(text ? { text } : {}),
+    ...(signals.length > 0 ? { signals } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(Array.isArray(body.matchedRuleIds)
+      ? { matchedRuleIds: body.matchedRuleIds.filter((value) => typeof value === 'string') }
+      : {}),
+    ...(taskType ? { taskType } : {}),
+    ...(typeof confidence === 'number' ? { confidence } : {}),
   });
 
   if (!agentResult.lead) {
@@ -4758,7 +4849,7 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
       triggerType: 'tag_change',
       tags: agentResult.lead.tags ?? [],
       stage: agentResult.lead.stage,
-      text,
+      ...(text ? { text } : {}),
     });
   }
 
@@ -4769,7 +4860,7 @@ api.post('/v1/agent/leads/:id/score', async (c) => {
       triggerType: 'stage_change',
       tags: agentResult.lead.tags ?? [],
       stage: agentResult.lead.stage,
-      text,
+      ...(text ? { text } : {}),
     });
   }
 
@@ -4807,6 +4898,7 @@ api.get('/v1/webhook-deliveries', async (c) => {
         .map((value) => value.trim())
         .filter((value) => webhookStatuses.has(value))
     : [];
+  const statusFilter = statuses as WebhookDeliveryStatus[];
 
   const eventTypes = eventQuery
     ? eventQuery
@@ -4817,7 +4909,7 @@ api.get('/v1/webhook-deliveries', async (c) => {
 
   const where: Prisma.WebhookDeliveryWhereInput = {
     organizationId: c.get('tenantId'),
-    ...(statuses.length > 0 ? { status: { in: statuses } } : {}),
+    ...(statusFilter.length > 0 ? { status: { in: statusFilter } } : {}),
     ...(eventTypes.length > 0 ? { eventType: { in: eventTypes } } : {}),
   };
 
@@ -4854,6 +4946,7 @@ api.get('/v1/messages', async (c) => {
         .map((value) => value.trim())
         .filter((value) => messageStatuses.has(value))
     : [];
+  const statusFilter = statuses as MessageStatus[];
 
   const channelIds = channelQuery
     ? channelQuery
@@ -4864,7 +4957,7 @@ api.get('/v1/messages', async (c) => {
 
   const where: Prisma.MessageWhereInput = {
     organizationId: c.get('tenantId'),
-    ...(statuses.length > 0 ? { status: { in: statuses } } : {}),
+    ...(statusFilter.length > 0 ? { status: { in: statusFilter } } : {}),
     ...(channelIds.length > 0 ? { channelId: { in: channelIds } } : {}),
   };
 
@@ -4915,7 +5008,9 @@ api.get('/v1/campaigns', async (c) => {
 
   const where: Prisma.CampaignWhereInput = {
     organizationId: c.get('tenantId'),
-    ...(statuses.length > 0 ? { status: { in: statuses as Prisma.CampaignStatus[] } } : {}),
+    ...(statuses.length > 0
+      ? { status: { in: statuses as CampaignStatus[] } }
+      : {}),
     ...(channelIds.length > 0 ? { channelId: { in: channelIds } } : {}),
   };
 
@@ -4934,7 +5029,7 @@ api.get('/v1/campaigns', async (c) => {
 });
 
 api.post('/v1/campaigns/preview', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const segment = normalizeCampaignSegment(body.segment);
 
   const where = buildSegmentWhere(c.get('tenantId'), segment);
@@ -4944,7 +5039,7 @@ api.post('/v1/campaigns/preview', async (c) => {
 });
 
 api.post('/v1/campaigns', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const channelId = typeof body.channelId === 'string' ? body.channelId.trim() : '';
   const messageText = typeof body.messageText === 'string' ? body.messageText.trim() : '';
@@ -4966,7 +5061,7 @@ api.post('/v1/campaigns', async (c) => {
     return c.json({ error: 'unsupported_platform' }, 400);
   }
 
-  let scheduledAt: Date | undefined;
+  let scheduledAt: Date | null = null;
   if (typeof scheduledAtRaw === 'string' || typeof scheduledAtRaw === 'number') {
     const parsed = new Date(scheduledAtRaw);
     if (Number.isNaN(parsed.getTime())) {
@@ -4981,7 +5076,7 @@ api.post('/v1/campaigns', async (c) => {
     const segment = await tx.campaignSegment.create({
       data: {
         organizationId: c.get('tenantId'),
-        stages: segmentInput.stages as Prisma.LeadStage[],
+        stages: segmentInput.stages as LeadStage[],
         tagsAll: segmentInput.tagsAll,
         sources: segmentInput.sources,
         lastActiveWithinDays: segmentInput.lastActiveWithinDays,
@@ -5006,7 +5101,7 @@ api.post('/v1/campaigns', async (c) => {
 });
 
 api.post('/v1/campaigns/:id/schedule', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const scheduledAtRaw = body.scheduledAt;
 
   let scheduledAt: Date | null = null;
@@ -5087,7 +5182,7 @@ api.get('/v1/journeys', async (c) => {
 });
 
 api.post('/v1/journeys', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
 
   if (!name) {
@@ -5115,9 +5210,9 @@ api.post('/v1/journeys', async (c) => {
         data: triggers.map((trigger) => ({
           organizationId: c.get('tenantId'),
           journeyId: created.id,
-          type: trigger.type,
+          type: trigger.type as JourneyTriggerType,
           enabled: trigger.enabled,
-          config: trigger.config,
+          config: toNullableJson(trigger.config),
         })),
       });
     }
@@ -5128,10 +5223,10 @@ api.post('/v1/journeys', async (c) => {
           id: node.id,
           organizationId: c.get('tenantId'),
           journeyId: created.id,
-          type: node.type,
+          type: node.type as JourneyNodeType,
           label: node.label,
-          config: node.config,
-          position: node.position,
+          config: toNullableJson(node.config),
+          position: toNullableJson(node.position),
         })),
       });
     }
@@ -5145,7 +5240,7 @@ api.post('/v1/journeys', async (c) => {
           fromNodeId: edge.fromNodeId,
           toNodeId: edge.toNodeId,
           label: edge.label,
-          config: edge.config,
+          config: toNullableJson(edge.config),
         })),
       });
     }
@@ -5177,7 +5272,7 @@ api.get('/v1/journeys/:id', async (c) => {
 });
 
 api.put('/v1/journeys/:id', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const journey = await prisma.journey.findFirst({
     where: { id: c.req.param('id'), organizationId: c.get('tenantId') },
   });
@@ -5210,9 +5305,9 @@ api.put('/v1/journeys/:id', async (c) => {
         data: triggers.map((trigger) => ({
           organizationId: c.get('tenantId'),
           journeyId: journey.id,
-          type: trigger.type,
+          type: trigger.type as JourneyTriggerType,
           enabled: trigger.enabled,
-          config: trigger.config,
+          config: toNullableJson(trigger.config),
         })),
       });
     }
@@ -5227,7 +5322,7 @@ api.put('/v1/journeys/:id', async (c) => {
           fromNodeId: edge.fromNodeId,
           toNodeId: edge.toNodeId,
           label: edge.label,
-          config: edge.config,
+          config: toNullableJson(edge.config),
         })),
       });
     }
@@ -5236,19 +5331,19 @@ api.put('/v1/journeys/:id', async (c) => {
       await tx.journeyNode.upsert({
         where: { id: node.id },
         update: {
-          type: node.type,
+          type: node.type as JourneyNodeType,
           label: node.label,
-          config: node.config,
-          position: node.position,
+          config: toNullableJson(node.config),
+          position: toNullableJson(node.position),
         },
         create: {
           id: node.id,
           organizationId: c.get('tenantId'),
           journeyId: journey.id,
-          type: node.type,
+          type: node.type as JourneyNodeType,
           label: node.label,
-          config: node.config,
-          position: node.position,
+          config: toNullableJson(node.config),
+          position: toNullableJson(node.position),
         },
       });
     }
@@ -5304,28 +5399,37 @@ api.get('/v1/channels', async (c) => {
 });
 
 api.post('/v1/channels', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
 
   if (!body.name || !body.platform || !body.externalId || !body.credentials) {
     return c.json({ error: 'invalid_payload' }, 400);
   }
 
-  if (!supportedPlatforms.has(body.platform as string)) {
+  const platformRaw = body.platform as string;
+  if (!supportedPlatforms.has(platformRaw)) {
     return c.json({ error: 'invalid_platform' }, 400);
   }
 
+  const channelData: Prisma.ChannelCreateInput = {
+    organization: { connect: { id: c.get('tenantId') } },
+    platform: platformRaw as Platform,
+    name: body.name as string,
+    externalId: body.externalId as string,
+    status: 'pending',
+    credentials: toInputJson(body.credentials),
+  };
+  if (typeof body.provider === 'string' && body.provider.trim().length > 0) {
+    channelData.provider = body.provider;
+  }
+  if (body.settings && typeof body.settings === 'object' && !Array.isArray(body.settings)) {
+    channelData.settings = toInputJson(body.settings);
+  }
+  if (body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)) {
+    channelData.metadata = toInputJson(body.metadata);
+  }
+
   const channel = await prisma.channel.create({
-    data: {
-      organizationId: c.get('tenantId'),
-      platform: body.platform as string,
-      provider: typeof body.provider === 'string' ? body.provider : undefined,
-      name: body.name as string,
-      externalId: body.externalId as string,
-      status: 'pending',
-      credentials: body.credentials as Record<string, unknown>,
-      settings: (body.settings as Record<string, unknown>) ?? undefined,
-      metadata: (body.metadata as Record<string, unknown>) ?? undefined,
-    },
+    data: channelData,
   });
 
   return c.json({ channel }, 201);
@@ -5333,7 +5437,7 @@ api.post('/v1/channels', async (c) => {
 
 api.post('/v1/whatsapp/channels/:channelId/messages', async (c) => {
   const channelId = c.req.param('channelId');
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
 
   const rawTo = typeof body.to === 'string' ? body.to.trim() : '';
   const rawText = typeof body.text === 'string' ? body.text.trim() : '';
@@ -5368,19 +5472,28 @@ api.post('/v1/whatsapp/channels/:channelId/messages', async (c) => {
   if (!normalizedTo) {
     return c.json({ error: 'invalid_recipient' }, 400);
   }
+  const platform: Platform = 'whatsapp';
 
-  const contact = await findOrCreateContact({
+  const contactInput: {
+    organizationId: string;
+    platform: Platform;
+    externalId: string;
+    name?: string;
+  } = {
     organizationId: c.get('tenantId'),
-    platform: 'whatsapp',
+    platform,
     externalId: normalizedTo,
-    name,
-  });
+  };
+  if (name) {
+    contactInput.name = name;
+  }
+  const contact = await findOrCreateContact(contactInput);
 
   const conversation = await upsertConversation({
     organizationId: c.get('tenantId'),
     channelId: channel.id,
     contactId: contact.id,
-    platform: 'whatsapp',
+    platform,
     externalId: normalizedTo,
   });
 
@@ -5390,7 +5503,7 @@ api.post('/v1/whatsapp/channels/:channelId/messages', async (c) => {
       conversationId: conversation.id,
       channelId: channel.id,
       contactId: contact.id,
-      platform: 'whatsapp',
+      platform,
       type: 'text',
       direction: 'outbound',
       status: 'pending',
@@ -5413,7 +5526,7 @@ api.post('/v1/whatsapp/channels/:channelId/messages', async (c) => {
 });
 
 api.post('/v1/mock/whatsapp/inbound', async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const channelId = body.channelId as string | undefined;
   const from = body.from as string | undefined;
   const text = body.text as string | undefined;
@@ -5457,13 +5570,21 @@ api.post('/v1/mock/whatsapp/inbound', async (c) => {
     timestamp = parsed;
   }
 
-  const payload = adapter.buildMockPayload({
+  const mockInput: Parameters<typeof adapter.buildMockPayload>[0] = {
     from,
-    name: typeof body.name === 'string' ? body.name : undefined,
     text,
-    messageId: typeof body.messageId === 'string' ? body.messageId : undefined,
-    timestamp,
-  });
+  };
+  if (typeof body.name === 'string') {
+    mockInput.name = body.name;
+  }
+  if (typeof body.messageId === 'string') {
+    mockInput.messageId = body.messageId;
+  }
+  if (timestamp) {
+    mockInput.timestamp = timestamp;
+  }
+
+  const payload = adapter.buildMockPayload(mockInput);
 
   await inboundQueue.add(
     'wa.webhook.mock',
@@ -5487,7 +5608,7 @@ admin.post('/v1/admin/bootstrap', async (c) => {
     return c.json({ error: 'forbidden' }, 403);
   }
 
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+  const body = await readJsonBody(c);
   const name = body.name as string | undefined;
   const slug = body.slug as string | undefined;
   const apiKeyName = (body.apiKeyName as string | undefined) ?? 'default';

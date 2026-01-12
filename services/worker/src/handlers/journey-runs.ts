@@ -148,8 +148,8 @@ const evaluateCondition = (
   return true;
 };
 
-const selectEdgesForCondition = (
-  edges: Array<{ label: string | null }>,
+const selectEdgesForCondition = <T extends { label: string | null }>(
+  edges: T[],
   outcome: boolean
 ) => {
   const label = outcome ? 'true' : 'false';
@@ -184,16 +184,12 @@ const createRunSteps = async (input: {
   });
 
   await Promise.all(
-    steps.map((step) =>
-      journeyQueue.add(
-        'journey.step',
-        { type: 'step', runStepId: step.id },
-        {
-          ...defaultJobOptions,
-          delay: delayMs > 0 ? delayMs : undefined,
-        }
-      )
-    )
+    steps.map((step) => {
+      const jobOptions = delayMs > 0
+        ? { ...defaultJobOptions, delay: delayMs }
+        : defaultJobOptions;
+      return journeyQueue.add('journey.step', { type: 'step', runStepId: step.id }, jobOptions);
+    })
   );
 };
 
@@ -306,17 +302,40 @@ const handleTriggerJob = async (job: JourneyTriggerJob) => {
           edges: trigger.journey.edges,
         },
       },
-      context: {
-        organizationId: job.organizationId,
-        leadId: job.leadId ?? lead?.id,
-        contactId: job.contactId ?? lead?.contactId ?? undefined,
-        channelId: job.channelId ?? undefined,
-        conversationId: job.conversationId ?? lead?.conversationId ?? undefined,
-        messageId: job.messageId ?? undefined,
-        text: job.text ?? undefined,
-        tags,
-        stage,
-      },
+      context: (() => {
+        const context: {
+          organizationId: string;
+          tags: string[];
+          stage?: string | null;
+          leadId?: string;
+          contactId?: string;
+          channelId?: string;
+          conversationId?: string;
+          messageId?: string;
+          text?: string;
+        } = {
+          organizationId: job.organizationId,
+          tags,
+          stage,
+        };
+
+        const resolvedLeadId = job.leadId ?? lead?.id;
+        if (resolvedLeadId) context.leadId = resolvedLeadId;
+        const resolvedContactId = job.contactId ?? lead?.contactId ?? undefined;
+        if (typeof resolvedContactId === 'string') {
+          context.contactId = resolvedContactId;
+        }
+        if (job.channelId) context.channelId = job.channelId;
+        const resolvedConversationId = job.conversationId ?? lead?.conversationId ?? undefined;
+        if (typeof resolvedConversationId === 'string') {
+          context.conversationId = resolvedConversationId;
+        }
+        if (job.messageId) context.messageId = job.messageId;
+        if (typeof job.text === 'string') {
+          context.text = job.text;
+        }
+        return context;
+      })(),
     });
   }
 };
@@ -447,12 +466,16 @@ const handleStepJob = async (job: JourneyStepJob) => {
         )
       );
 
+      const leadUpdates: Record<string, unknown> = {
+        tags: updatedTags,
+      };
+      if (typeof nextStage === 'string') {
+        leadUpdates.stage = nextStage;
+      }
+
       await prisma.lead.update({
         where: { id: lead.id },
-        data: {
-          tags: updatedTags,
-          stage: nextStage ?? undefined,
-        },
+        data: leadUpdates,
       });
 
       await prisma.journeyRunStep.update({

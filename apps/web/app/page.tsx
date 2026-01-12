@@ -534,7 +534,9 @@ export default function Home() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
-                <span>Proxy: /v1 -> API_BASE (next.config.mjs)</span>
+                <span>
+                  Proxy: /v1 -{'>'} API_BASE (next.config.mjs)
+                </span>
                 <span>Key stored in localStorage</span>
               </div>
             </div>

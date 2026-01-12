@@ -99,7 +99,7 @@ const resolveOutputs = (input: {
   text: string;
   outputMap: Record<string, unknown> | null;
   responsePath: string;
-}) => {
+}): Record<string, unknown> => {
   const { parsed, text, outputMap, responsePath } = input;
 
   if (outputMap && parsed && typeof parsed === 'object') {
@@ -120,7 +120,7 @@ const resolveOutputs = (input: {
   }
 
   if (parsed && typeof parsed === 'object') {
-    return Array.isArray(parsed) ? { data: parsed } : parsed;
+    return Array.isArray(parsed) ? { data: parsed } : (parsed as Record<string, unknown>);
   }
 
   return { text };
@@ -296,12 +296,15 @@ export const httpExternalAdapter: ExternalToolAdapter = {
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
-        const response = await fetch(finalUrl, {
+        const init: RequestInit = {
           method,
           headers,
-          body,
           signal: controller.signal,
-        });
+        };
+        if (body !== undefined) {
+          init.body = body;
+        }
+        const response = await fetch(finalUrl, init);
 
         const text = await response.text();
         const contentType = response.headers.get('content-type') ?? '';

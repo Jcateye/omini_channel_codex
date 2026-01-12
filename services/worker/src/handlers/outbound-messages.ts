@@ -1,4 +1,4 @@
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createWorker, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter } from '@omini/whatsapp-bsp';
 
@@ -147,20 +147,24 @@ export const registerOutboundMessagesWorker = () =>
         },
       });
 
+      const updateData: Prisma.MessageUncheckedUpdateInput = {
+        status: 'sent',
+        sentAt: new Date(),
+        rawPayload: {
+          request: {
+            to,
+            text,
+          },
+          response: result.rawResponse ?? null,
+        } as Prisma.InputJsonValue,
+      };
+      if (result.providerMessageId) {
+        updateData.externalId = result.providerMessageId;
+      }
+
       await prisma.message.update({
         where: { id: message.id },
-        data: {
-          status: 'sent',
-          externalId: result.providerMessageId,
-          sentAt: new Date(),
-          rawPayload: {
-            request: {
-              to,
-              text,
-            },
-            response: result.rawResponse ?? null,
-          },
-        },
+        data: updateData,
       });
 
       if (campaignSend) {
@@ -190,7 +194,7 @@ export const registerOutboundMessagesWorker = () =>
             error: errorMessage,
             attempt: job.attempts + 1,
             provider,
-          },
+          } as Prisma.InputJsonValue,
         },
       });
 

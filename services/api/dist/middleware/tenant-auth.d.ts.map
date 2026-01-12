@@ -1,0 +1,1 @@
+{"version":3,"file":"tenant-auth.d.ts","sourceRoot":"","sources":["../../src/middleware/tenant-auth.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,OAAO,EAAE,IAAI,EAAE,MAAM,MAAM,CAAC;AAI1C,KAAK,eAAe,GAAG;IACrB,QAAQ,EAAE,MAAM,CAAC;IACjB,QAAQ,EAAE,MAAM,CAAC;CAClB,CAAC;AAEF,eAAO,MAAM,UAAU,GAAU,GAAG,OAAO,CAAC;IAAE,SAAS,EAAE,eAAe,CAAA;CAAE,CAAC,EAAE,MAAM,IAAI;;iBAiBtF,CAAC"}

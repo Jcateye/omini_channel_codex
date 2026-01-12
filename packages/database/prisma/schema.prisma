@@ -276,6 +276,7 @@ model Contact {
   conversations Conversation[]
   messages      Message[]
   leads         Lead[]
+  journeyRuns  JourneyRun[]
 
   @@index([organizationId])
   @@index([organizationId, phone])
@@ -479,6 +480,7 @@ model Journey {
   edges       JourneyEdge[]
   runs        JourneyRun[]
   attributions AttributionTouchpoint[]
+  leadAttributions LeadAttribution[]
 
   @@index([organizationId])
   @@index([status])

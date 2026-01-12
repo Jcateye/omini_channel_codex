@@ -125,14 +125,23 @@ const parseInbound = (payload: Record<string, unknown>): InboundMessage | null =
   const timestamp = createdDatetime ? new Date(createdDatetime) : new Date();
   const safeTimestamp = Number.isNaN(timestamp.getTime()) ? new Date() : timestamp;
 
-  return {
-    externalId: typeof message.id === 'string' ? message.id : undefined,
+  const result: InboundMessage = {
     senderExternalId: msisdn,
-    senderName: typeof contact.displayName === 'string' ? contact.displayName : undefined,
     timestamp: safeTimestamp,
-    text,
     rawPayload: payload,
   };
+
+  if (typeof message.id === 'string') {
+    result.externalId = message.id;
+  }
+  if (typeof contact.displayName === 'string') {
+    result.senderName = contact.displayName;
+  }
+  if (typeof text === 'string') {
+    result.text = text;
+  }
+
+  return result;
 };
 
 const buildMockPayload = (input: MockInboundInput): Record<string, unknown> => {
@@ -236,10 +245,16 @@ const sendText = async (input: OutboundSendInput): Promise<OutboundSendResult> =
   const providerMessageId =
     responseJson && typeof responseJson.id === 'string' ? responseJson.id : undefined;
 
-  return {
-    providerMessageId,
-    rawResponse: responseJson ?? (responseText ? { raw: responseText } : undefined),
-  };
+  const result: OutboundSendResult = {};
+  if (providerMessageId) {
+    result.providerMessageId = providerMessageId;
+  }
+  if (responseJson) {
+    result.rawResponse = responseJson;
+  } else if (responseText) {
+    result.rawResponse = { raw: responseText };
+  }
+  return result;
 };
 
 const parseStatus = (payload: Record<string, unknown>): StatusEvent | null => {
@@ -266,13 +281,18 @@ const parseStatus = (payload: Record<string, unknown>): StatusEvent | null => {
     pickString(errorObject?.message) ??
     pickString(errorObject?.description);
 
-  return {
+  const event: StatusEvent = {
     providerMessageId,
     status,
     rawPayload: payload,
-    occurredAt: timestamp,
-    errorMessage,
   };
+  if (timestamp) {
+    event.occurredAt = timestamp;
+  }
+  if (errorMessage) {
+    event.errorMessage = errorMessage;
+  }
+  return event;
 };
 
 export const messagebirdAdapter: WhatsAppBspAdapter = {

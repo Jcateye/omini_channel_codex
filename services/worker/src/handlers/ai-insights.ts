@@ -220,7 +220,7 @@ const processWindow = async (windowStart: Date, windowEnd: Date) => {
 export const registerAiInsightsWorker = () =>
   createWorker<AiInsightJob>(QUEUE_NAMES.aiInsights, async ({ data }) => {
     const now = new Date();
-    const { windowStart, windowEnd } = resolveWindow(now);
+    const { windowStart } = resolveWindow(now);
     const requested = data.windowStart ? new Date(data.windowStart) : null;
     const start = requested && !Number.isNaN(requested.getTime()) ? requested : windowStart;
     const end = new Date(start.getTime() + 60000);

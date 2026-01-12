@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 
 type KnowledgeSyncJob =
@@ -664,7 +664,7 @@ const handleSyncSource = async (syncId: string) => {
       status: errorMessage ? 'failed' : 'completed',
       completedAt: new Date(),
       errorMessage,
-      metadata: stats ? { ...existingMetadata, ...stats } : existingMetadata,
+      metadata: (stats ? { ...existingMetadata, ...stats } : existingMetadata) as Prisma.InputJsonValue,
     },
   });
 };

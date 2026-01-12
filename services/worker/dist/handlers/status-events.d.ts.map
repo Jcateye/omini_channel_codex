@@ -1,0 +1,1 @@
+{"version":3,"file":"status-events.d.ts","sourceRoot":"","sources":["../../src/handlers/status-events.ts"],"names":[],"mappings":"AAMA,MAAM,MAAM,gBAAgB,GAAG;IAC7B,SAAS,EAAE,MAAM,CAAC;IAClB,OAAO,EAAE,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CAAC;IACjC,OAAO,CAAC,EAAE,MAAM,CAAC;IACjB,OAAO,CAAC,EAAE,MAAM,CAAC,MAAM,EAAE,MAAM,CAAC,CAAC;CAClC,CAAC;AA4CF,eAAO,MAAM,0BAA0B,gEAyDnC,CAAC"}

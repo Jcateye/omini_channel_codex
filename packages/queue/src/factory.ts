@@ -13,7 +13,7 @@ export interface QueueConnectionConfig {
 
 export class QueueFactory {
   private connection: Redis;
-  private queues = new Map<string, Queue>();
+  private queues = new Map<string, Queue<unknown>>();
 
   constructor(config?: QueueConnectionConfig) {
     if (config?.redisUrl) {
@@ -21,13 +21,22 @@ export class QueueFactory {
         maxRetriesPerRequest: null,
       });
     } else {
-      this.connection = new Redis({
+      const options: {
+        host: string;
+        port: number;
+        db: number;
+        password?: string;
+        maxRetriesPerRequest: null;
+      } = {
         host: config?.host ?? 'localhost',
         port: config?.port ?? 6379,
-        password: config?.password,
         db: config?.db ?? 0,
         maxRetriesPerRequest: null,
-      });
+      };
+      if (typeof config?.password === 'string') {
+        options.password = config.password;
+      }
+      this.connection = new Redis(options);
     }
   }
 
@@ -45,7 +54,7 @@ export class QueueFactory {
       },
     });
 
-    this.queues.set(name, queue);
+    this.queues.set(name, queue as Queue<unknown>);
     return queue;
   }
 

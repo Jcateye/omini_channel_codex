@@ -1,5 +1,5 @@
 import { applyLeadRules, type LeadRule } from '@omini/core';
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createQueue, createWorker, defaultJobOptions, QUEUE_NAMES } from '@omini/queue';
 import { getWhatsAppAdapter, type InboundMessage } from '@omini/whatsapp-bsp';
 import { enqueueJourneyTrigger } from './journey-runs.js';
@@ -118,7 +118,7 @@ const findOrCreateContact = async (organizationId: string, phone: string, name?:
   return prisma.contact.create({
     data: {
       organizationId,
-      name,
+      name: name ?? null,
       phone,
       identifiers: {
         create: {
@@ -195,7 +195,7 @@ const findOrCreateLead = async (
   return { lead, created: true };
 };
 
-const extractMessageText = (message?: ParsedMessage) => message?.text?.trim();
+const extractMessageText = (message?: InboundMessage) => message?.text?.trim();
 
 const handleMessageEvent = async (
   channel: {
@@ -224,21 +224,25 @@ const handleMessageEvent = async (
     lastMessageAt: parsed.timestamp,
   });
 
+  const messageData: Prisma.MessageUncheckedCreateInput = {
+    organizationId: channel.organizationId,
+    conversationId: conversation.id,
+    channelId: channel.id,
+    contactId: contact.id,
+    platform: 'whatsapp',
+    type: 'text',
+    direction: 'inbound',
+    status: 'delivered',
+    content: { text: parsed.text ?? '' } as Prisma.InputJsonValue,
+    rawPayload: parsed.rawPayload as Prisma.InputJsonValue,
+    sentAt: parsed.timestamp,
+  };
+  if (typeof parsed.externalId === 'string') {
+    messageData.externalId = parsed.externalId;
+  }
+
   const inboundMessage = await prisma.message.create({
-    data: {
-      organizationId: channel.organizationId,
-      conversationId: conversation.id,
-      channelId: channel.id,
-      contactId: contact.id,
-      platform: 'whatsapp',
-      externalId: parsed.externalId,
-      type: 'text',
-      direction: 'inbound',
-      status: 'delivered',
-      content: { text: parsed.text ?? '' },
-      rawPayload: parsed.rawPayload,
-      sentAt: parsed.timestamp,
-    },
+    data: messageData,
   });
 
   const { lead, created } = await findOrCreateLead(
@@ -257,6 +261,11 @@ const handleMessageEvent = async (
 
   if (leadRules.length > 0) {
     const messageText = extractMessageText(parsed);
+    const ruleContext: { text?: string; signals: string[] } = { signals: [] };
+    if (messageText) {
+      ruleContext.text = messageText;
+    }
+
     ruleResult = applyLeadRules(
       {
         tags: lead.tags,
@@ -269,7 +278,7 @@ const handleMessageEvent = async (
             : null,
       },
       leadRules,
-      { text: messageText, signals: [] }
+      ruleContext
     );
 
     if (Object.keys(ruleResult.updates).length > 0) {
@@ -287,7 +296,19 @@ const handleMessageEvent = async (
     previousTags.some((tag) => !(updatedLead.tags ?? []).includes(tag));
   const stageChanged = previousStage !== updatedLead.stage;
 
-  await enqueueJourneyTrigger({
+  const baseTrigger: {
+    type: 'trigger';
+    triggerType: 'inbound_message' | 'tag_change' | 'stage_change';
+    organizationId: string;
+    leadId: string;
+    contactId: string;
+    channelId: string;
+    conversationId: string;
+    messageId: string;
+    tags: string[];
+    stage: string;
+    text?: string;
+  } = {
     type: 'trigger',
     triggerType: 'inbound_message',
     organizationId: channel.organizationId,
@@ -296,41 +317,23 @@ const handleMessageEvent = async (
     channelId: channel.id,
     conversationId: conversation.id,
     messageId: inboundMessage.id,
-    text: parsed.text ?? undefined,
     tags: updatedLead.tags ?? [],
     stage: updatedLead.stage,
-  });
+  };
+  if (typeof parsed.text === 'string') {
+    baseTrigger.text = parsed.text;
+  }
+
+  await enqueueJourneyTrigger(baseTrigger);
 
   if (tagsChanged) {
-    await enqueueJourneyTrigger({
-      type: 'trigger',
-      triggerType: 'tag_change',
-      organizationId: channel.organizationId,
-      leadId: updatedLead.id,
-      contactId: contact.id,
-      channelId: channel.id,
-      conversationId: conversation.id,
-      messageId: inboundMessage.id,
-      text: parsed.text ?? undefined,
-      tags: updatedLead.tags ?? [],
-      stage: updatedLead.stage,
-    });
+    const tagTrigger = { ...baseTrigger, triggerType: 'tag_change' as const };
+    await enqueueJourneyTrigger(tagTrigger);
   }
 
   if (stageChanged) {
-    await enqueueJourneyTrigger({
-      type: 'trigger',
-      triggerType: 'stage_change',
-      organizationId: channel.organizationId,
-      leadId: updatedLead.id,
-      contactId: contact.id,
-      channelId: channel.id,
-      conversationId: conversation.id,
-      messageId: inboundMessage.id,
-      text: parsed.text ?? undefined,
-      tags: updatedLead.tags ?? [],
-      stage: updatedLead.stage,
-    });
+    const stageTrigger = { ...baseTrigger, triggerType: 'stage_change' as const };
+    await enqueueJourneyTrigger(stageTrigger);
   }
 
   if (created) {
@@ -349,26 +352,30 @@ const handleMessageEvent = async (
       },
       settings
     );
-    await agentRepliesQueue.add(
-      'agent.reply',
-      {
-        context: {
-          organizationId: channel.organizationId,
-          channelId: channel.id,
-          conversationId: conversation.id,
-          contactId: contact.id,
-          leadId: updatedLead.id,
-          messageId: inboundMessage.id,
-          platform: channel.platform,
-          provider: channel.provider,
-          text: parsed.text,
-          tags: updatedLead.tags ?? [],
-          stage: updatedLead.stage,
-          source: updatedLead.source,
-        },
-      },
-      defaultJobOptions
-    );
+    const replyContext = {
+      organizationId: channel.organizationId,
+      channelId: channel.id,
+      conversationId: conversation.id,
+      contactId: contact.id,
+      leadId: updatedLead.id,
+      messageId: inboundMessage.id,
+      platform: channel.platform,
+    } as const;
+
+    const replyJob: { context: typeof replyContext & { provider?: string | null; text?: string; tags?: string[]; stage?: string; source?: string | null } } = {
+      context: { ...replyContext },
+    };
+    replyJob.context.provider = channel.provider;
+    if (typeof parsed.text === 'string') {
+      replyJob.context.text = parsed.text;
+    }
+    replyJob.context.tags = updatedLead.tags ?? [];
+    replyJob.context.stage = updatedLead.stage;
+    if (updatedLead.source !== undefined) {
+      replyJob.context.source = updatedLead.source;
+    }
+
+    await agentRepliesQueue.add('agent.reply', replyJob, defaultJobOptions);
     return;
   }
 
@@ -387,26 +394,30 @@ const handleMessageEvent = async (
     );
   }
 
-  await agentRepliesQueue.add(
-    'agent.reply',
-    {
-      context: {
-        organizationId: channel.organizationId,
-        channelId: channel.id,
-        conversationId: conversation.id,
-        contactId: contact.id,
-        leadId: updatedLead.id,
-        messageId: inboundMessage.id,
-        platform: channel.platform,
-        provider: channel.provider,
-        text: parsed.text,
-        tags: updatedLead.tags ?? [],
-        stage: updatedLead.stage,
-        source: updatedLead.source,
-      },
-    },
-    defaultJobOptions
-  );
+  const replyContext = {
+    organizationId: channel.organizationId,
+    channelId: channel.id,
+    conversationId: conversation.id,
+    contactId: contact.id,
+    leadId: updatedLead.id,
+    messageId: inboundMessage.id,
+    platform: channel.platform,
+  } as const;
+
+  const replyJob: { context: typeof replyContext & { provider?: string | null; text?: string; tags?: string[]; stage?: string; source?: string | null } } = {
+    context: { ...replyContext },
+  };
+  replyJob.context.provider = channel.provider;
+  if (typeof parsed.text === 'string') {
+    replyJob.context.text = parsed.text;
+  }
+  replyJob.context.tags = updatedLead.tags ?? [];
+  replyJob.context.stage = updatedLead.stage;
+  if (updatedLead.source !== undefined) {
+    replyJob.context.source = updatedLead.source;
+  }
+
+  await agentRepliesQueue.add('agent.reply', replyJob, defaultJobOptions);
 };
 
 export const registerInboundEventsWorker = () =>

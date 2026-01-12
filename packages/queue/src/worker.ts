@@ -1,5 +1,5 @@
-import { Worker as BullWorker, Job } from 'bullmq';
-import type { IConnection, Processor } from 'bullmq';
+import { Worker as BullWorker } from 'bullmq';
+import type { ConnectionOptions, Job, Processor } from 'bullmq';
 
 import type { QueueJobData } from './types.js';
 
@@ -8,23 +8,29 @@ export class Worker<T = Record<string, unknown>, R = unknown> {
 
   constructor(
     private readonly queueName: string,
-    private readonly connection: IConnection,
+    private readonly connection: ConnectionOptions,
     private readonly concurrency = 1
   ) {}
 
   process(handler: (job: QueueJobData<T>) => Promise<R>): void {
-    const processor: Processor<T, R> = async (job: Job<T>) =>
-      handler({
+    const processor: Processor<T, R> = async (job: Job<T>) => {
+      const result: QueueJobData<T> = {
         id: job.id ?? '',
         name: job.name,
         data: job.data,
         attempts: job.attemptsMade,
         maxAttempts: job.opts.attempts ?? 3,
-        priority: job.opts.priority,
         delay: job.opts.delay ?? 0,
         createdAt: new Date(job.timestamp),
-        processedAt: job.processedOn ? new Date(job.processedOn) : undefined,
-      });
+      };
+      if (job.opts.priority !== undefined) {
+        result.priority = job.opts.priority;
+      }
+      if (job.processedOn) {
+        result.processedAt = new Date(job.processedOn);
+      }
+      return handler(result);
+    };
 
     this.worker = new BullWorker<T, R>(this.queueName, processor, {
       connection: this.connection,

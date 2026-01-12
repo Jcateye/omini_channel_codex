@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { prisma } from '@omini/database';
+import { prisma, Prisma } from '@omini/database';
 import { createWorker, QUEUE_NAMES } from '@omini/queue';
 
 export type CrmWebhookJob = {
@@ -47,14 +47,23 @@ const resolveConfig = async (organizationId: string): Promise<CrmWebhookConfig |
     return null;
   }
 
-  return {
+  const config: CrmWebhookConfig = {
     url,
-    secret: typeof raw.secret === 'string' ? raw.secret : undefined,
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
-    headers: typeof raw.headers === 'object' ? (raw.headers as Record<string, string>) : undefined,
     mode,
-    events: Array.isArray(raw.events) ? (raw.events as string[]) : undefined,
   };
+
+  if (typeof raw.secret === 'string') {
+    config.secret = raw.secret;
+  }
+  if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) {
+    config.headers = raw.headers as Record<string, string>;
+  }
+  if (Array.isArray(raw.events)) {
+    config.events = raw.events as string[];
+  }
+
+  return config;
 };
 
 export const registerCrmWebhooksWorker = () =>
@@ -66,7 +75,7 @@ export const registerCrmWebhooksWorker = () =>
         organizationId: data.organizationId,
         eventType: data.eventType,
         targetUrl: config?.url ?? 'unconfigured',
-        payload: data.payload,
+        payload: data.payload as Prisma.InputJsonValue,
         status: 'pending',
         attempt: 1,
       },
